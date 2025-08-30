@@ -20,12 +20,10 @@ from PIL import Image
 import fitz
 
 # --- Настройка ---
-# Токены и ID берутся из переменных окружения Vercel для безопасности
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'YOUR_FALLBACK_TOKEN')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'YOUR_FALLBACK_API_KEY')
-# ID пользователей указываются через запятую в настройках Vercel
-ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS', '123456789')
-ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')]
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
+ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
@@ -34,16 +32,12 @@ DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- Инициализация Gemini API ---
-try:
+if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-except Exception as e:
-    logger.error(f"Ошибка конфигурации Gemini API: {e}")
-    # В среде Vercel мы не можем просто выйти, поэтому просто логируем
-    
+
 # --- Декоратор для проверки авторизации ---
 def restricted(func):
     @wraps(func)
@@ -59,8 +53,9 @@ def restricted(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-# --- Вспомогательные функции ---
+# --- Вспомогательные функции (без изменений) ---
 async def send_long_message(update: Update, text: str):
+    # ... (код функции без изменений)
     if not text.strip(): return
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
         await update.message.reply_text(text)
@@ -71,6 +66,7 @@ async def send_long_message(update: Update, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    # ... (код функции без изменений)
     try:
         if not response.candidates:
             prompt_feedback = response.prompt_feedback
@@ -113,10 +109,11 @@ async def handle_gemini_response(update: Update, response):
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа от модели: {e}")
 
-# --- Функции-обработчики ---
 
+# --- Функции-обработчики (без изменений) ---
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код функции без изменений)
     user = update.effective_user
     context.user_data.setdefault('model_name', 'gemini-1.5-flash')
     await update.message.reply_html(rf"Привет, {user.mention_html()}!")
@@ -124,6 +121,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код функции без изменений)
     keyboard = [
         [InlineKeyboardButton("Gemini 2.5 Pro (Документы/Текст)", callback_data='gemini-2.5-pro')],
         [InlineKeyboardButton("Gemini 1.5 Pro (Документы/Текст)", callback_data='gemini-1.5-pro')],
@@ -136,6 +134,7 @@ async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код функции без изменений)
     query = update.callback_query
     await query.answer()
     selected_model = query.data
@@ -149,6 +148,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код функции без изменений)
     user_message = update.message.text
     model_name = context.user_data.get('model_name', 'gemini-1.5-flash')
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
@@ -162,6 +162,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код функции без изменений)
     model_name = context.user_data.get('model_name', 'gemini-1.5-flash')
     if model_name != 'gemini-2.5-flash-image-preview':
         await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
@@ -184,6 +185,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @restricted
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код функции без изменений)
     model_name = context.user_data.get('model_name', 'gemini-1.5-flash')
     if model_name not in DOCUMENT_ANALYSIS_MODELS:
         await update.message.reply_text(f"Для анализа PDF, выберите модель Pro...")
@@ -221,13 +223,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Ошибка при обработке PDF: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке PDF: {e}')
 
-
 # --- Точка входа для Vercel ---
 
-# 1. Создаем объект приложения один раз при старте
+# 1. Создаем объект приложения
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-# 2. Регистрируем все наши обработчики, как и раньше
+# 2. Регистрируем все наши обработчики
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("model", model_selection))
 application.add_handler(CallbackQueryHandler(button_callback))
@@ -235,19 +236,22 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 application.add_handler(MessageHandler(filters.Document.PDF, handle_document_message))
 
-# 3. Создаем Flask-приложение, которое будет точкой входа для Vercel
+# 3. Создаем Flask-приложение
 app = Flask(__name__)
 
+# 4. Создаем асинхронную функцию для обработки обновлений
+async def process_update_async(update_data):
+    # Используем async with для правильной инициализации и закрытия
+    async with application:
+        update = Update.de_json(update_data, application.bot)
+        await application.process_update(update)
+
+# 5. Создаем синхронную точку входа для Vercel
 @app.route('/api/bot', methods=['POST'])
 def webhook():
-    """Эта функция вызывается каждый раз, когда Telegram присылает сообщение."""
+    """Эта функция вызывается Vercel'ом и запускает асинхронную обработку."""
     try:
-        update_data = request.get_json(force=True)
-        update = Update.de_json(update_data, application.bot)
-        
-        # Запускаем обработку этого одного сообщения в асинхронном режиме
-        asyncio.run(application.process_update(update))
-        
+        asyncio.run(process_update_async(request.get_json(force=True)))
         return Response('ok', status=200)
     except Exception as e:
         logger.error(f"Ошибка в webhook: {e}")
