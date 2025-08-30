@@ -2,4 +2,7 @@ python-telegram-bot
 google-generativeai
 Pillow
 PyMuPDF
+
 Flask
+psycopg2-binary 
+SQLAlchemy       
