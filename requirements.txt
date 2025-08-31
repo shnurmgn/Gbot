@@ -2,7 +2,5 @@ python-telegram-bot
 google-generativeai
 Pillow
 PyMuPDF
-
 Flask
-    
-
+redis
