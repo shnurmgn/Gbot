@@ -4,3 +4,4 @@ Pillow
 PyMuPDF
 Flask
 upstash-redis
+nest-asyncio
