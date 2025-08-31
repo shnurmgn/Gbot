@@ -26,34 +26,24 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 
-# --- ИСПРАВЛЕНИЕ: ЯВНАЯ ИНИЦИАЛИЗАЦИЯ КЛИЕНТА KV ---
-# 1. Читаем все необходимые переменные из окружения вручную
-kv_url = os.environ.get('KV_URL')
-kv_rest_api_url = os.environ.get('KV_REST_API_URL')
-kv_rest_api_token = os.environ.get('KV_REST_API_TOKEN')
-kv_rest_api_read_only_token = os.environ.get('KV_REST_API_READ_ONLY_TOKEN')
-
-# 2. Создаем клиент, только если все переменные найдены, и передаем их явно
-kv = None
-if kv_url and kv_rest_api_url and kv_rest_api_token and kv_rest_api_read_only_token:
-    try:
-        kv = VercelKV(
-            url=kv_url,
-            rest_api_url=kv_rest_api_url,
-            rest_api_token=kv_rest_api_token,
-            rest_api_read_only_token=kv_rest_api_read_only_token
-        )
-        logging.info("Успешно и ЯВНО подключено к Vercel KV.")
-    except Exception as e:
-        logging.error(f"Не удалось подключиться к KV с явными параметрами: {e}")
-else:
-    logging.error("Не найдены все необходимые переменные окружения для Vercel KV.")
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
+HISTORY_LIMIT = 10 
 
 # --- Настройка логирования ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# --- Инициализация клиента KV ---
+# Этот конструктор без аргументов автоматически подхватит переменные KV_... из окружения Vercel.
+kv = None
+try:
+    kv = VercelKV()
+    logger.info("Успешно создан экземпляр VercelKV.")
+except Exception as e:
+    logger.error(f"Не удалось создать экземпляр VercelKV: {e}")
 
 # --- Инициализация Gemini API ---
 if GEMINI_API_KEY:
@@ -138,8 +128,8 @@ def get_history(user_id: int) -> list:
 def update_history(user_id: int, chat_history: list):
     if not kv: return
     history_to_save = [{'role': p.role, 'parts': [part.text for part in p.parts]} for p in chat_history]
-    if len(history_to_save) > 10:
-        history_to_save = history_to_save[-10:]
+    if len(history_to_save) > HISTORY_LIMIT:
+        history_to_save = history_to_save[-HISTORY_LIMIT:]
     try:
         kv.set(f"history:{user_id}", json.dumps(history_to_save))
     except Exception as e:
@@ -203,7 +193,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         kv.set(f"user:{user_id}:model", selected_model)
         message_text = f"Модель изменена на: {selected_model}. Я запомню ваш выбор."
-        if selected_model in ['gemini-1.5-pro', 'gemini-2.5-pro']:
+        if selected_model in DOCUMENT_ANALYSIS_MODELS:
             message_text += "\n\nЭта модель отлично подходит для анализа PDF."
         await query.edit_message_text(text=message_text)
     except Exception as e:
