@@ -3,3 +3,4 @@ google-generativeai
 Pillow
 PyMuPDF
 upstash-redis
+python-docx
