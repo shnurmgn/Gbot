@@ -21,7 +21,7 @@ import fitz
 from upstash_redis import Redis
 import nest_asyncio
 
-# --- ПРИМЕНЯЕМ ПАТЧ ASYNCIO ---
+# --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: ПРИМЕНЯЕМ ПАТЧ ASYNCIO ---
 # Это должно быть в самом начале, до создания любых асинхронных объектов
 nest_asyncio.apply()
 
@@ -87,7 +87,6 @@ async def handle_gemini_response(update: Update, response):
             block_reason = getattr(prompt_feedback, 'block_reason_message', 'Причина не указана.')
             await update.message.reply_text(f"⚠️ Запрос был заблокирован.\nПричина: {block_reason}")
             return
-
         candidate = response.candidates[0]
         if candidate.finish_reason.name != "STOP":
             finish_reason_name = candidate.finish_reason.name
@@ -103,11 +102,9 @@ async def handle_gemini_response(update: Update, response):
                 parse_mode='Markdown'
             )
             return
-
         if not candidate.content.parts:
             await update.message.reply_text("Модель вернула пустой ответ.")
             return
-
         for part in candidate.content.parts:
             if hasattr(part, 'text') and part.text:
                 await send_long_message(update, part.text)
@@ -163,7 +160,6 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         redis_client.delete(f"history:{user_id}")
-        logger.info(f"История для пользователя {user_id} очищена.")
         await update.message.reply_text("Память очищена. Начинаем новый диалог!")
     except Exception as e:
         logger.error(f"Ошибка очистки истории в Redis для user_id {user_id}: {e}")
@@ -187,11 +183,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
     selected_model = query.data
-    
     if not redis_client:
         await query.edit_message_text(text="Хранилище данных не настроено.")
         return
-
     try:
         redis_client.set(f"user:{user_id}:model", selected_model)
         message_text = f"Модель изменена на: {selected_model}. Я запомню ваш выбор."
@@ -207,7 +201,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
     model_name = get_user_model(user_id)
-            
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
         history = get_history(user_id)
@@ -262,7 +255,6 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         content_parts = [caption]
         page_limit = 25 
         num_pages = min(len(pdf_document), page_limit)
-
         for page_num in range(num_pages):
             page = pdf_document.load_page(page_num)
             pix = page.get_pixmap()
@@ -270,12 +262,10 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             img = Image.open(io.BytesIO(img_bytes))
             content_parts.append(img)
         pdf_document.close()
-        
         notice = f"Отправляю первые {num_pages} страниц в Gemini на анализ..."
         if len(pdf_document) > page_limit:
             notice += f"\n(Документ слишком большой, анализ ограничен первыми {page_limit} страницами)"
         await update.message.reply_text(notice)
-
         model = genai.GenerativeModel(model_name)
         response = model.generate_content(content_parts)
         await handle_gemini_response(update, response)
@@ -285,9 +275,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
 
 # --- Точка входа для Vercel ---
-
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clear", clear_history))
 application.add_handler(CommandHandler("model", model_selection))
@@ -295,7 +283,6 @@ application.add_handler(CallbackQueryHandler(button_callback))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 application.add_handler(MessageHandler(filters.Document.PDF, handle_document_message))
-
 app = Flask(__name__)
 
 async def process_update_async(update_data):
