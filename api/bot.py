@@ -19,6 +19,11 @@ from telegram.ext import (
 from PIL import Image
 import fitz
 from upstash_redis import Redis
+import nest_asyncio
+
+# --- ПРИМЕНЯЕМ ПАТЧ ASYNCIO ---
+# Это должно быть в самом начале, до создания любых асинхронных объектов
+nest_asyncio.apply()
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -40,7 +45,7 @@ try:
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
-    logging.error(f"Не удалось подключиться к Redis. Убедитесь, что UPSTASH_REDIS_URL и UPSTASH_REDIS_TOKEN правильно заданы в Vercel. Ошибка: {e}")
+    logging.error(f"Не удалось подключиться к Redis: {e}")
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -143,7 +148,6 @@ def get_user_model(user_id: int) -> str:
         return default_model
 
 # --- Функции-обработчики ---
-
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -302,7 +306,7 @@ async def process_update_async(update_data):
 @app.route('/api/bot', methods=['POST'])
 def webhook():
     """
-    Финальная, каноническая версия точки входа для Vercel.
+    Финальная версия с nest_asyncio: возвращаемся к asyncio.run()
     """
     try:
         asyncio.run(process_update_async(request.get_json(force=True)))
