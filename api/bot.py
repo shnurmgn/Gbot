@@ -17,11 +17,10 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 
-TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10 
+# --- Инициализация клиентов (глобальные объекты) ---
+# Создаем один экземпляр бота, который будет переиспользоваться
+bot_instance = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
-# --- Подключение к Upstash Redis ---
 redis_client = None
 try:
     redis_client = Redis(
@@ -41,36 +40,36 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # --- Вспомогательные функции ---
-async def send_long_message(bot: telegram.Bot, chat_id: int, text: str):
+async def send_long_message(chat_id: int, text: str):
     if not text.strip(): return
-    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
-        await bot.send_message(chat_id, text)
+    if len(text) <= 4096:
+        await bot_instance.send_message(chat_id, text)
     else:
-        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
-            chunk = text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
-            await bot.send_message(chat_id, chunk)
+        for i in range(0, len(text), 4096):
+            chunk = text[i:i + 4096]
+            await bot_instance.send_message(chat_id, chunk)
             await asyncio.sleep(0.5)
 
-async def handle_gemini_response(bot: telegram.Bot, chat_id: int, response):
+async def handle_gemini_response(chat_id: int, response):
     try:
         if not response.candidates:
-            await bot.send_message(chat_id, f"⚠️ Запрос был заблокирован.\nПричина: {getattr(response.prompt_feedback, 'block_reason_message', 'Причина не указана.')}")
+            await bot_instance.send_message(chat_id, f"⚠️ Запрос был заблокирован.")
             return
         candidate = response.candidates[0]
         if candidate.finish_reason.name != "STOP":
-            await bot.send_message(chat_id, f"⚠️ Контент не может быть сгенерирован.\nПричина: `{candidate.finish_reason.name}`", parse_mode='Markdown')
+            await bot_instance.send_message(chat_id, f"⚠️ Контент не может быть сгенерирован. Причина: `{candidate.finish_reason.name}`", parse_mode='Markdown')
             return
         if not candidate.content.parts:
-            await bot.send_message(chat_id, "Модель вернула пустой ответ.")
+            await bot_instance.send_message(chat_id, "Модель вернула пустой ответ.")
             return
         for part in candidate.content.parts:
             if hasattr(part, 'text') and part.text:
-                await send_long_message(bot, chat_id, part.text)
+                await send_long_message(chat_id, part.text)
             elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
-                await bot.send_photo(chat_id, photo=io.BytesIO(part.inline_data.data))
+                await bot_instance.send_photo(chat_id, photo=io.BytesIO(part.inline_data.data))
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
-        await bot.send_message(chat_id, f"Произошла критическая ошибка при обработке ответа от модели: {e}")
+        await bot_instance.send_message(chat_id, f"Произошла критическая ошибка при обработке ответа: {e}")
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
@@ -82,8 +81,8 @@ def get_history(user_id: int) -> list:
 def update_history(user_id: int, chat_history: list):
     if not redis_client: return
     history_to_save = [{'role': p.role, 'parts': [part.text for part in p.parts]} for p in chat_history]
-    if len(history_to_save) > HISTORY_LIMIT:
-        history_to_save = history_to_save[-HISTORY_LIMIT:]
+    if len(history_to_save) > 10:
+        history_to_save = history_to_save[-10:]
     redis_client.set(f"history:{user_id}", json.dumps(history_to_save), ex=86400)
 
 def get_user_model(user_id: int) -> str:
@@ -95,7 +94,7 @@ def get_user_model(user_id: int) -> str:
     except Exception: return default_model
 
 # --- Логика обработки команд и сообщений ---
-async def handle_update(update: Update, bot: telegram.Bot):
+async def handle_update(update: Update):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -117,28 +116,28 @@ async def handle_update(update: Update, bot: telegram.Bot):
         text = update.message.text
         if text == "/start":
             model_name = get_user_model(user_id)
-            await bot.send_message(chat_id, f"Привет! Я бот Gemini.\nТекущая модель: {model_name}.\nЧтобы очистить память, используйте /clear.")
+            await bot_instance.send_message(chat_id, f"Привет! Я бот Gemini.\nТекущая модель: {model_name}.\nЧтобы очистить память, используйте /clear.")
         elif text == "/clear":
             if redis_client: redis_client.delete(f"history:{user_id}")
-            await bot.send_message(chat_id, "Память очищена.")
+            await bot_instance.send_message(chat_id, "Память очищена.")
         elif text == "/model":
             keyboard = [[InlineKeyboardButton(name, callback_data=name)] for name in ['gemini-2.5-pro', 'gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-2.5-flash-image-preview']]
-            await bot.send_message(chat_id, 'Выберите модель:', reply_markup=InlineKeyboardMarkup(keyboard))
-        else: # Обычное текстовое сообщение
-            await bot.send_chat_action(chat_id, telegram.constants.ChatAction.TYPING)
+            await bot_instance.send_message(chat_id, 'Выберите модель:', reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await bot_instance.send_chat_action(chat_id, telegram.constants.ChatAction.TYPING)
             model_name = get_user_model(user_id)
             history = get_history(user_id)
             model = genai.GenerativeModel(model_name)
             chat = model.start_chat(history=history)
             response = await chat.send_message_async(text)
             update_history(user_id, chat.history)
-            await handle_gemini_response(bot, chat_id, response)
+            await handle_gemini_response(chat_id, response)
     
     elif update.message.photo:
-        await bot.send_chat_action(chat_id, telegram.constants.ChatAction.UPLOAD_PHOTO)
+        await bot_instance.send_chat_action(chat_id, telegram.constants.ChatAction.UPLOAD_PHOTO)
         model_name = get_user_model(user_id)
         if model_name != 'gemini-2.5-flash-image-preview':
-            await bot.send_message(chat_id, "Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
+            await bot_instance.send_message(chat_id, "Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
             return
         photo_file = await update.message.photo[-1].get_file()
         caption = update.message.caption or "Опиши это изображение"
@@ -148,17 +147,17 @@ async def handle_update(update: Update, bot: telegram.Bot):
         img = Image.open(photo_bytes)
         model_gemini = genai.GenerativeModel(model_name)
         response = await model_gemini.generate_content_async([caption, img])
-        await handle_gemini_response(bot, chat_id, response)
+        await handle_gemini_response(chat_id, response)
 
     elif update.message.document and update.message.document.mime_type == 'application/pdf':
-        await bot.send_chat_action(chat_id, telegram.constants.ChatAction.TYPING)
+        await bot_instance.send_chat_action(chat_id, telegram.constants.ChatAction.TYPING)
         model_name = get_user_model(user_id)
-        if model_name not in DOCUMENT_ANALYSIS_MODELS:
-            await bot.send_message(chat_id, f"Для анализа PDF, выберите модель Pro...")
+        if model_name not in ['gemini-1.5-pro', 'gemini-2.5-pro']:
+            await bot_instance.send_message(chat_id, f"Для анализа PDF, выберите модель Pro...")
             return
         doc_file = await update.message.document.get_file()
         caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
-        await bot.send_message(chat_id, f"Получил PDF: {update.message.document.file_name}...")
+        await bot_instance.send_message(chat_id, f"Получил PDF: {update.message.document.file_name}...")
         pdf_bytes = io.BytesIO()
         await doc_file.download_to_memory(pdf_bytes)
         pdf_bytes.seek(0)
@@ -173,15 +172,13 @@ async def handle_update(update: Update, bot: telegram.Bot):
             img = Image.open(io.BytesIO(img_bytes))
             content_parts.append(img)
         pdf_document.close()
-        await bot.send_message(chat_id, f"Отправляю первые {num_pages} страниц в Gemini на анализ...")
+        await bot_instance.send_message(chat_id, f"Отправляю первые {num_pages} страниц в Gemini на анализ...")
         model_gemini = genai.GenerativeModel(model_name)
         response = await model_gemini.generate_content_async(content_parts)
-        await handle_gemini_response(bot, chat_id, response)
-
+        await handle_gemini_response(chat_id, response)
 
 # --- Точка входа для Vercel на FastAPI ---
 app = FastAPI()
-bot_instance = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
 @app.post("/api/bot")
 async def webhook(request: Request):
@@ -189,7 +186,7 @@ async def webhook(request: Request):
     try:
         update_data = await request.json()
         update = Update.de_json(update_data, bot_instance)
-        await handle_update(update, bot_instance)
+        await handle_update(update)
         return Response(status_code=200)
     except Exception as e:
         logger.error(f"Ошибка в webhook FastAPI: {e}")
