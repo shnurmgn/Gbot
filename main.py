@@ -2,7 +2,6 @@ import logging
 import asyncio
 import io
 import os
-import time
 from functools import wraps
 import json
 import docx
@@ -31,18 +30,19 @@ TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 HISTORY_LIMIT = 10
 
-# --- Подключение к Upstash Redis ---
+# --- Подключение к Upstash Redis (ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
 redis_client = None
 try:
+    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses=True'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -56,7 +56,6 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
-            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             return
         return await func(update, context, *args, **kwargs)
@@ -72,38 +71,6 @@ async def send_long_message(update: Update, text: str):
             await update.message.reply_text(text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH])
             await asyncio.sleep(0.5)
 
-async def handle_gemini_response_stream(update: Update, response_stream):
-    placeholder_message = None
-    full_response_text = ""
-    last_update_time = 0
-    update_interval = 0.8
-
-    try:
-        placeholder_message = await update.message.reply_text("...")
-        last_update_time = time.time()
-
-        async for chunk in response_stream:
-            if chunk.text:
-                full_response_text += chunk.text
-                current_time = time.time()
-                if current_time - last_update_time > update_interval:
-                    try:
-                        await placeholder_message.edit_text(full_response_text + " ✍️")
-                        last_update_time = current_time
-                    except telegram.error.BadRequest:
-                        pass
-        
-        if placeholder_message and full_response_text:
-            await placeholder_message.edit_text(full_response_text)
-        
-        update_history(update.effective_user.id, update.message.text, full_response_text)
-
-    except Exception as e:
-        logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        error_text = f"Произошла ошибка при генерации ответа: {e}"
-        if placeholder_message: await placeholder_message.edit_text(error_text)
-        else: await update.message.reply_text(error_text)
-        
 async def handle_gemini_response(update: Update, response):
     try:
         if not response.candidates:
@@ -129,23 +96,23 @@ def get_history(user_id: int) -> list:
     if not redis_client: return []
     try:
         history_data = redis_client.get(f"history:{user_id}")
+        # upstash-redis v1+ сам декодирует JSON строки, если они были строками
         return json.loads(history_data) if history_data else []
     except Exception: return []
 
-def update_history(user_id: int, user_message_text: str, model_response_text: str):
+def update_history(user_id: int, chat_history: list):
     if not redis_client: return
-    history = get_history(user_id)
-    history.append({'role': 'user', 'parts': [{'text': user_message_text}]})
-    history.append({'role': 'model', 'parts': [{'text': model_response_text}]})
-    if len(history) > HISTORY_LIMIT:
-        history = history[-HISTORY_LIMIT:]
-    redis_client.set(f"history:{user_id}", json.dumps(history), ex=86400)
+    history_to_save = [{'role': p.role, 'parts': [part.text for part in p.parts]} for p in chat_history]
+    if len(history_to_save) > HISTORY_LIMIT:
+        history_to_save = history_to_save[-HISTORY_LIMIT:]
+    redis_client.set(f"history:{user_id}", json.dumps(history_to_save), ex=86400)
 
 def get_user_model(user_id: int) -> str:
     default_model = 'gemini-1.5-flash'
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
+        # upstash-redis v1+ возвращает уже строку, decode не нужен
         return stored_model if stored_model else default_model
     except Exception: return default_model
 
@@ -193,15 +160,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         history = get_history(user_id)
         model = genai.GenerativeModel(model_name)
-        
-        content_with_history = [{'role': h['role'], 'parts': h['parts']} for h in history]
-        content_with_history.append({'role': 'user', 'parts': [{'text': user_message}]})
-
-        response_stream = await model.generate_content_async(content_with_history, stream=True)
-        await handle_gemini_response_stream(update, response_stream)
-        
+        chat = model.start_chat(history=history)
+        response = await chat.send_message_async(user_message)
+        update_history(user_id, chat.history)
+        await handle_gemini_response(update, response)
     except Exception as e:
-        logger.error(f"Ошибка при обработке текстового сообщения со стримингом: {e}")
+        logger.error(f"Ошибка при обработке текстового сообщения с историей: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
 
 @restricted
@@ -276,9 +240,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 # --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
+    
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Регистрация всех наших обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("model", model_selection))
