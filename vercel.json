@@ -7,16 +7,14 @@
   ],
   "routes": [
     {
-      "src": "/api/bot",
+      "src": "/api/(.*)",
       "dest": "api/bot.py"
     }
   ],
   "crons": [
     {
-      "path": "/api/bot?cron_secret=MySuperSecretCronKey123,
+      "path": "/api/process-queue?cron_secret=MySuperSecretCronKey123",
       "schedule": "* * * * *"
     }
   ]
 }
-
-
