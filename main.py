@@ -32,15 +32,14 @@ TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 HISTORY_LIMIT = 10
 
-# --- Подключение к Upstash Redis (ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
+# --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
-    # Важно: upstash-redis сам декодирует ответы, вручную это делать не нужно.
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
@@ -59,7 +58,6 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
-            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             return
         return await func(update, context, *args, **kwargs)
@@ -93,27 +91,37 @@ async def send_long_message(update: Update, text: str):
 
 async def handle_gemini_response(update: Update, response):
     """Обрабатывает НЕ-стриминговые ответы (фото, документы)."""
-    if hasattr(response, 'usage_metadata'):
-        update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
+        # Обновляем статистику, если она есть
+        if hasattr(response, 'usage_metadata'):
+            update_usage_stats(update.effective_user.id, response.usage_metadata)
+
+        # Проверяем, был ли запрос полностью заблокирован
         if not response.candidates:
             await update.message.reply_text(f"⚠️ Запрос был заблокирован.\nПричина: {getattr(response.prompt_feedback, 'block_reason_message', 'Причина не указана.')}")
             return
+            
         candidate = response.candidates[0]
+        # Проверяем причину завершения
         if candidate.finish_reason.name != "STOP":
             await update.message.reply_text(f"⚠️ Контент не может быть сгенерирован. Причина: `{candidate.finish_reason.name}`", parse_mode='Markdown')
             return
+            
+        # Проверяем, есть ли вообще контент
         if not candidate.content.parts:
-            await update.message.reply_text("Модель вернула пустой ответ.")
+            await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
             return
+
         full_text = ""
         for part in candidate.content.parts:
             if hasattr(part, 'text') and part.text:
                 full_text += part.text
             elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
                 await update.message.reply_photo(photo=io.BytesIO(part.inline_data.data))
+        
         if full_text:
             await send_long_message(update, full_text)
+            
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
@@ -127,6 +135,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
+        
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
@@ -139,12 +148,22 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                     except telegram.error.BadRequest:
                         pass
         
+        # После завершения стрима, проверяем, не пустой ли ответ
+        if not full_response_text.strip():
+            await placeholder_message.edit_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
+            # Проверяем причину "пустого" ответа
+            final_response = await response_stream.response
+            if not final_response.candidates or final_response.candidates[0].finish_reason.name != "STOP":
+                 logger.warning(f"Стриминг завершился с причиной, отличной от STOP: {final_response}")
+            return
+
         await placeholder_message.delete()
         await send_long_message(update, full_response_text)
         
         update_history(update.effective_user.id, user_message_text, full_response_text)
-        if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
-            update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
+        final_response = await response_stream.response
+        if hasattr(final_response, 'usage_metadata') and final_response.usage_metadata:
+            update_usage_stats(update.effective_user.id, final_response.usage_metadata)
             
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
