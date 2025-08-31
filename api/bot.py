@@ -273,7 +273,6 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Ошибка при обработке PDF: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке PDF: {e}')
 
-
 # --- Точка входа для Vercel ---
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
