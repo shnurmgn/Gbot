@@ -22,7 +22,7 @@ from PIL import Image
 import fitz
 from upstash_redis import Redis
 
-# --- Настройка ---
+# --- Настройка (читает переменные окружения сервера) ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
@@ -30,20 +30,22 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10 
+HISTORY_LIMIT = 10
 
-# --- Подключение к Upstash Redis ---
+# --- Подключение к Upstash Redis (ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
 redis_client = None
 try:
+    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
+    # Важно: upstash-redis сам декодирует ответы, вручную это делать не нужно.
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -57,13 +59,13 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
 # --- Вспомогательные функции ---
-
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -89,6 +91,7 @@ async def send_long_message(update: Update, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    """Обрабатывает НЕ-стриминговые ответы (фото, документы)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -115,6 +118,7 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
+    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -128,22 +132,15 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                 current_time = time.time()
                 if current_time - last_update_time > update_interval:
                     try:
-                        # Редактируем, только если накапливаемый текст не превышает лимит
-                        # Добавляем запас в 10 символов для индикатора
                         if len(full_response_text) < TELEGRAM_MAX_MESSAGE_LENGTH - 10:
                             await placeholder_message.edit_text(full_response_text + " ✍️")
                             last_update_time = current_time
                     except telegram.error.BadRequest:
-                        pass # Игнорируем ошибку, если текст не изменился
+                        pass
         
-        # После завершения стрима, удаляем временное сообщение
-        if placeholder_message:
-            await placeholder_message.delete()
-        
-        # И отправляем полный текст через функцию, которая умеет его делить
+        await placeholder_message.delete()
         await send_long_message(update, full_response_text)
         
-        # Обновляем историю и статистику
         update_history(update.effective_user.id, user_message_text, full_response_text)
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
@@ -338,7 +335,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("model", model_selection))
@@ -349,7 +346,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     supported_files_filter = filters.Document.PDF | filters.Document.DOCX | filters.Document.TXT
     application.add_handler(MessageHandler(supported_files_filter, handle_document_message))
-
+    
     logger.info("Бот запущен и работает в режиме опроса...")
     application.run_polling()
 
