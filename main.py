@@ -66,6 +66,7 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
+
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
