@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 from PIL import Image
 import fitz
-from vercel_kv import KV as VercelKV
+from upstash_redis import Redis
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -36,14 +36,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Инициализация клиента KV ---
-# Этот конструктор без аргументов автоматически подхватит переменные KV_... из окружения Vercel.
-kv = None
+# --- Подключение к Upstash Redis (прямой метод) ---
+redis_client = None
 try:
-    kv = VercelKV()
-    logger.info("Успешно создан экземпляр VercelKV.")
+    redis_client = Redis(
+        url=os.environ.get('UPSTASH_REDIS_URL'),
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+    )
+    # Проверяем подключение
+    redis_client.ping()
+    logger.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
-    logger.error(f"Не удалось создать экземпляр VercelKV: {e}")
+    logger.error(f"Не удалось подключиться к Redis. Убедитесь, что UPSTASH_REDIS_URL и UPSTASH_REDIS_TOKEN правильно заданы в Vercel. Ошибка: {e}")
 
 # --- Инициализация Gemini API ---
 if GEMINI_API_KEY:
@@ -65,11 +69,11 @@ def restricted(func):
 # --- Вспомогательные функции ---
 async def send_long_message(update: Update, text: str):
     if not text.strip(): return
-    if len(text) <= 4096:
+    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
         await update.message.reply_text(text)
     else:
-        for i in range(0, len(text), 4096):
-            chunk = text[i:i + 4096]
+        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
+            chunk = text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
             await update.message.reply_text(chunk)
             await asyncio.sleep(0.5)
 
@@ -117,31 +121,32 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа от модели: {e}")
 
 def get_history(user_id: int) -> list:
-    if not kv: return []
+    if not redis_client: return []
     try:
-        history_json = kv.get(f"history:{user_id}")
-        return json.loads(history_json) if history_json else []
+        history_data = redis_client.get(f"history:{user_id}")
+        return json.loads(history_data) if history_data else []
     except Exception as e:
-        logger.error(f"Ошибка чтения истории из KV для user_id {user_id}: {e}")
+        logger.error(f"Ошибка чтения истории из Redis для user_id {user_id}: {e}")
         return []
 
 def update_history(user_id: int, chat_history: list):
-    if not kv: return
+    if not redis_client: return
     history_to_save = [{'role': p.role, 'parts': [part.text for part in p.parts]} for p in chat_history]
     if len(history_to_save) > HISTORY_LIMIT:
         history_to_save = history_to_save[-HISTORY_LIMIT:]
     try:
-        kv.set(f"history:{user_id}", json.dumps(history_to_save))
+        redis_client.set(f"history:{user_id}", json.dumps(history_to_save), ex=86400)
     except Exception as e:
-        logger.error(f"Ошибка сохранения истории в KV для user_id {user_id}: {e}")
+        logger.error(f"Ошибка сохранения истории в Redis для user_id {user_id}: {e}")
 
 def get_user_model(user_id: int) -> str:
     default_model = 'gemini-1.5-flash'
-    if not kv: return default_model
+    if not redis_client: return default_model
     try:
-        return kv.get(f"user:{user_id}:model") or default_model
+        stored_model = redis_client.get(f"user:{user_id}:model")
+        return stored_model.decode('utf-8') if stored_model else default_model
     except Exception as e:
-        logger.error(f"Ошибка чтения модели из KV для user_id {user_id}: {e}")
+        logger.error(f"Ошибка чтения модели из Redis для user_id {user_id}: {e}")
         return default_model
 
 # --- Функции-обработчики ---
@@ -156,15 +161,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not kv:
+    if not redis_client:
         await update.message.reply_text("Хранилище не подключено.")
         return
     try:
-        kv.delete(f"history:{user_id}")
+        redis_client.delete(f"history:{user_id}")
         logger.info(f"История для пользователя {user_id} очищена.")
         await update.message.reply_text("Память очищена. Начинаем новый диалог!")
     except Exception as e:
-        logger.error(f"Ошибка очистки истории в KV для user_id {user_id}: {e}")
+        logger.error(f"Ошибка очистки истории в Redis для user_id {user_id}: {e}")
         await update.message.reply_text("Не удалось очистить историю.")
 
 @restricted
@@ -186,18 +191,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     selected_model = query.data
     
-    if not kv:
-        await query.edit_message_text(text="Хранилище не настроено.")
+    if not redis_client:
+        await query.edit_message_text(text="Хранилище данных не настроено.")
         return
 
     try:
-        kv.set(f"user:{user_id}:model", selected_model)
+        redis_client.set(f"user:{user_id}:model", selected_model)
         message_text = f"Модель изменена на: {selected_model}. Я запомню ваш выбор."
         if selected_model in DOCUMENT_ANALYSIS_MODELS:
             message_text += "\n\nЭта модель отлично подходит для анализа PDF."
         await query.edit_message_text(text=message_text)
     except Exception as e:
-        logger.error(f"Ошибка сохранения модели в KV: {e}")
+        logger.error(f"Ошибка сохранения модели в Redis: {e}")
         await query.edit_message_text(text="Не удалось сохранить ваш выбор.")
 
 @restricted
