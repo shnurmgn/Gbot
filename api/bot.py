@@ -143,7 +143,6 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        # ИСПРАВЛЕНИЕ: Убираем .decode(), так как upstash-redis возвращает уже строку
         return stored_model if stored_model else default_model
     except Exception as e:
         logger.error(f"Ошибка чтения модели из Redis для user_id {user_id}: {e}")
@@ -308,8 +307,19 @@ async def process_update_async(update_data):
 
 @app.route('/api/bot', methods=['POST'])
 def webhook():
+    """
+    Финальная, наиболее стабильная версия точки входа для Vercel.
+    """
     try:
-        asyncio.run(process_update_async(request.get_json(force=True)))
+        # Пытаемся получить существующий цикл событий
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # Если его нет, создаем новый и устанавливаем его как текущий
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    try:
+        loop.run_until_complete(process_update_async(request.get_json(force=True)))
         return Response('ok', status=200)
     except Exception as e:
         logger.error(f"Ошибка в webhook: {e}")
