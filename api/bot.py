@@ -28,26 +28,25 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10 
+HISTORY_LIMIT = 10
 
-# --- Настройка логирования ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# --- Подключение к Upstash Redis (прямой метод) ---
+# --- Подключение к Upstash Redis ---
 redis_client = None
 try:
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
-    # Проверяем подключение
     redis_client.ping()
-    logger.info("Успешно подключено к Upstash Redis.")
+    logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
-    logger.error(f"Не удалось подключиться к Redis. Убедитесь, что UPSTASH_REDIS_URL и UPSTASH_REDIS_TOKEN правильно заданы в Vercel. Ошибка: {e}")
+    logging.error(f"Не удалось подключиться к Redis. Убедитесь, что UPSTASH_REDIS_URL и UPSTASH_REDIS_TOKEN правильно заданы в Vercel. Ошибка: {e}")
+
+# --- Настройка логирования ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # --- Инициализация Gemini API ---
 if GEMINI_API_KEY:
@@ -308,8 +307,12 @@ async def process_update_async(update_data):
 
 @app.route('/api/bot', methods=['POST'])
 def webhook():
+    """
+    Синхронная точка входа для Vercel, которая надежно управляет циклом событий asyncio.
+    """
     try:
-        asyncio.run(process_update_async(request.get_json(force=True)))
+        loop = asyncio.get_event_loop_policy().get_event_loop()
+        loop.run_until_complete(process_update_async(request.get_json(force=True)))
         return Response('ok', status=200)
     except Exception as e:
         logger.error(f"Ошибка в webhook: {e}")
