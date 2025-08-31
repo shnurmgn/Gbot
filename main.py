@@ -30,18 +30,20 @@ TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 HISTORY_LIMIT = 10
 
-# --- Подключение к Upstash Redis ---
+# --- Подключение к Upstash Redis (ФИНАЛЬНАЯ ВЕРСИЯ) ---
 redis_client = None
 try:
+    # Убираем лишний параметр decode_responses=True
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
+    # Важно: upstash-redis сам декодирует ответы, вручную это делать не нужно.
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None # Убедимся, что клиент None в случае ошибки
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -51,6 +53,7 @@ if GEMINI_API_KEY:
 
 # --- Декоратор для проверки авторизации ---
 def restricted(func):
+    """Декоратор для ограничения доступа к боту."""
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
@@ -111,6 +114,7 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
+        # upstash-redis v1+ возвращает уже строку, decode не нужен
         return stored_model if stored_model else default_model
     except Exception: return default_model
 
@@ -198,7 +202,6 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     doc = update.message.document
     caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
     await update.message.reply_text(f"Получил файл: {doc.file_name}.\nНачинаю обработку...")
-    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
         doc_file = await doc.get_file()
         file_bytes_io = io.BytesIO()
@@ -238,10 +241,11 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
 # --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
+    """Запускает бота в режиме polling."""
     logger.info("Создание и настройка приложения...")
+    
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Регистрация всех наших обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("model", model_selection))
