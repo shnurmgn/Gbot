@@ -3,4 +3,4 @@ google-generativeai
 Pillow
 PyMuPDF
 Flask
-@vercel/kv
+vercel-kv
