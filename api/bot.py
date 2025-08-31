@@ -28,7 +28,7 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10
+HISTORY_LIMIT = 10 
 
 # --- Подключение к Upstash Redis ---
 redis_client = None
@@ -311,8 +311,7 @@ def webhook():
     Синхронная точка входа для Vercel, которая надежно управляет циклом событий asyncio.
     """
     try:
-        loop = asyncio.get_event_loop_policy().get_event_loop()
-        loop.run_until_complete(process_update_async(request.get_json(force=True)))
+        asyncio.run(process_update_async(request.get_json(force=True)))
         return Response('ok', status=200)
     except Exception as e:
         logger.error(f"Ошибка в webhook: {e}")
