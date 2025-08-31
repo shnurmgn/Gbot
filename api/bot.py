@@ -4,9 +4,9 @@ import io
 import os
 import json
 import google.generativeai as genai
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response
 import telegram
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from PIL import Image
 import fitz
 from upstash_redis import Redis
@@ -16,8 +16,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
-CRON_SECRET = os.environ.get('CRON_SECRET') # Секретный ключ для Cron
-MESSAGE_QUEUE_KEY = "message_queue"
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
+HISTORY_LIMIT = 10 
 
 # --- Подключение к Upstash Redis ---
 redis_client = None
@@ -25,7 +27,7 @@ try:
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True # Важно для работы со строками
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -38,91 +40,161 @@ logger = logging.getLogger(__name__)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# --- ВАЖНО: Весь наш старый код (обработчики, хелперы) теперь внутри одной асинхронной функции ---
-async def process_single_update(update_json: str):
-    """
-    Эта функция содержит всю логику нашего бота.
-    Она будет вызываться из Cron Job для каждого сообщения из очереди.
-    """
-    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-    update = Update.de_json(json.loads(update_json), bot)
-    
+# --- Вспомогательные функции ---
+async def send_long_message(bot: telegram.Bot, chat_id: int, text: str):
+    if not text.strip(): return
+    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        await bot.send_message(chat_id, text)
+    else:
+        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
+            chunk = text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
+            await bot.send_message(chat_id, chunk)
+            await asyncio.sleep(0.5)
+
+async def handle_gemini_response(bot: telegram.Bot, chat_id: int, response):
+    try:
+        if not response.candidates:
+            await bot.send_message(chat_id, f"⚠️ Запрос был заблокирован.\nПричина: {getattr(response.prompt_feedback, 'block_reason_message', 'Причина не указана.')}")
+            return
+        candidate = response.candidates[0]
+        if candidate.finish_reason.name != "STOP":
+            await bot.send_message(chat_id, f"⚠️ Контент не может быть сгенерирован.\nПричина: `{candidate.finish_reason.name}`", parse_mode='Markdown')
+            return
+        if not candidate.content.parts:
+            await bot.send_message(chat_id, "Модель вернула пустой ответ.")
+            return
+        for part in candidate.content.parts:
+            if hasattr(part, 'text') and part.text:
+                await send_long_message(bot, chat_id, part.text)
+            elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
+                await bot.send_photo(chat_id, photo=io.BytesIO(part.inline_data.data))
+    except Exception as e:
+        logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
+        await bot.send_message(chat_id, f"Произошла критическая ошибка при обработке ответа от модели: {e}")
+
+def get_history(user_id: int) -> list:
+    if not redis_client: return []
+    try:
+        history_data = redis_client.get(f"history:{user_id}")
+        return json.loads(history_data) if history_data else []
+    except Exception: return []
+
+def update_history(user_id: int, chat_history: list):
+    if not redis_client: return
+    history_to_save = [{'role': p.role, 'parts': [part.text for part in p.parts]} for p in chat_history]
+    if len(history_to_save) > HISTORY_LIMIT:
+        history_to_save = history_to_save[-HISTORY_LIMIT:]
+    redis_client.set(f"history:{user_id}", json.dumps(history_to_save), ex=86400)
+
+def get_user_model(user_id: int) -> str:
+    default_model = 'gemini-1.5-flash'
+    if not redis_client: return default_model
+    try:
+        stored_model = redis_client.get(f"user:{user_id}:model")
+        return stored_model if stored_model else default_model
+    except Exception: return default_model
+
+# --- Логика обработки команд и сообщений ---
+async def handle_update(update: Update, bot: telegram.Bot):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # 1. Авторизация
     if user_id not in ALLOWED_USER_IDS:
         logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
-        return # Тихо игнорируем
+        return
 
-    # 2. ПРОСТОЙ ПРИМЕР: отвечаем "эхом" на текстовое сообщение
-    #    СЮДА НУЖНО БУДЕТ ПОСТЕПЕННО ПЕРЕНЕСТИ ВСЮ ВАШУ ЛОГИКУ ОБРАБОТКИ
-    if update.message and update.message.text:
-        # Здесь должна быть ваша логика вызова Gemini
-        # Например:
-        # model = genai.GenerativeModel('gemini-1.5-flash')
-        # response = await model.generate_content_async(update.message.text)
-        # await bot.send_message(chat_id=chat_id, text=response.text)
-        
-        # Для начала, простое эхо:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"Сообщение получено и обработано фоновым процессом: '{update.message.text}'"
-        )
-    else:
-        await bot.send_message(chat_id=chat_id, text="Получено нетекстовое сообщение.")
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        selected_model = query.data
+        if redis_client: redis_client.set(f"user:{user_id}:model", selected_model)
+        await query.edit_message_text(text=f"Модель изменена на: {selected_model}. Я запомню ваш выбор.")
+        return
+
+    if not update.message: return
+
+    if update.message.text:
+        text = update.message.text
+        if text == "/start":
+            model_name = get_user_model(user_id)
+            await bot.send_message(chat_id, f"Привет! Я бот Gemini.\nТекущая модель: {model_name}.\nЧтобы очистить память, используйте /clear.")
+        elif text == "/clear":
+            if redis_client: redis_client.delete(f"history:{user_id}")
+            await bot.send_message(chat_id, "Память очищена.")
+        elif text == "/model":
+            keyboard = [[InlineKeyboardButton(name, callback_data=name)] for name in ['gemini-2.5-pro', 'gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-2.5-flash-image-preview']]
+            await bot.send_message(chat_id, 'Выберите модель:', reply_markup=InlineKeyboardMarkup(keyboard))
+        else: # Обычное текстовое сообщение
+            await bot.send_chat_action(chat_id, telegram.constants.ChatAction.TYPING)
+            model_name = get_user_model(user_id)
+            history = get_history(user_id)
+            model = genai.GenerativeModel(model_name)
+            chat = model.start_chat(history=history)
+            response = await chat.send_message_async(text)
+            update_history(user_id, chat.history)
+            await handle_gemini_response(bot, chat_id, response)
+    
+    elif update.message.photo:
+        await bot.send_chat_action(chat_id, telegram.constants.ChatAction.UPLOAD_PHOTO)
+        model_name = get_user_model(user_id)
+        if model_name != 'gemini-2.5-flash-image-preview':
+            await bot.send_message(chat_id, "Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
+            return
+        photo_file = await update.message.photo[-1].get_file()
+        caption = update.message.caption or "Опиши это изображение"
+        photo_bytes = io.BytesIO()
+        await photo_file.download_to_memory(photo_bytes)
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        model_gemini = genai.GenerativeModel(model_name)
+        response = await model_gemini.generate_content_async([caption, img])
+        await handle_gemini_response(bot, chat_id, response)
+
+    elif update.message.document and update.message.document.mime_type == 'application/pdf':
+        await bot.send_chat_action(chat_id, telegram.constants.ChatAction.TYPING)
+        model_name = get_user_model(user_id)
+        if model_name not in DOCUMENT_ANALYSIS_MODELS:
+            await bot.send_message(chat_id, f"Для анализа PDF, выберите модель Pro...")
+            return
+        doc_file = await update.message.document.get_file()
+        caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
+        await bot.send_message(chat_id, f"Получил PDF: {update.message.document.file_name}...")
+        pdf_bytes = io.BytesIO()
+        await doc_file.download_to_memory(pdf_bytes)
+        pdf_bytes.seek(0)
+        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        content_parts = [caption]
+        page_limit = 25 
+        num_pages = min(len(pdf_document), page_limit)
+        for page_num in range(num_pages):
+            page = pdf_document.load_page(page_num)
+            pix = page.get_pixmap()
+            img_bytes = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_bytes))
+            content_parts.append(img)
+        pdf_document.close()
+        await bot.send_message(chat_id, f"Отправляю первые {num_pages} страниц в Gemini на анализ...")
+        model_gemini = genai.GenerativeModel(model_name)
+        response = await model_gemini.generate_content_async(content_parts)
+        await handle_gemini_response(bot, chat_id, response)
 
 
 # --- Точка входа для Vercel на FastAPI ---
 app = FastAPI()
+bot_instance = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
 @app.post("/api/bot")
-async def webhook_receiver(request: Request):
-    """
-    ПРИЕМНИК: Мгновенно принимает сообщение от Telegram и кладет его в очередь (Redis).
-    """
+async def webhook(request: Request):
+    """Асинхронная точка входа, которая вручную обрабатывает Update."""
     try:
         update_data = await request.json()
-        if redis_client:
-            # Кладем сообщение в очередь
-            redis_client.rpush(MESSAGE_QUEUE_KEY, json.dumps(update_data))
-            return Response(status_code=200)
-        else:
-            logger.error("WEBHOOK: Redis не подключен, сообщение не сохранено.")
-            return Response(status_code=500)
+        update = Update.de_json(update_data, bot_instance)
+        await handle_update(update, bot_instance)
+        return Response(status_code=200)
     except Exception as e:
-        logger.error(f"Ошибка в webhook_receiver: {e}")
-        return Response(status_code=500)
-
-@app.get("/api/process-queue")
-async def cron_handler(request: Request):
-    """ОБРАБОТЧИК: Вызывается Vercel Cron Job каждую минуту."""
-    # 1. Проверяем секретный ключ
-    if request.query_params.get('cron_secret') != CRON_SECRET:
-        logger.warning("Попытка несанкционированного вызова Cron Job.")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # 2. Обрабатываем очередь
-    if not redis_client:
-        logger.error("CRON: Redis не подключен, обработка невозможна.")
-        return Response(status_code=500)
-    
-    try:
-        # Забираем до 5 сообщений из очереди за раз
-        # lpop возвращает одно, нужно будет использовать пайплайн для нескольких
-        messages_to_process = redis_client.lpop(MESSAGE_QUEUE_KEY, 5)
-        if not messages_to_process:
-            return Response(content='Очередь пуста.', status_code=200)
-        
-        # Запускаем обработку параллельно
-        tasks = [process_single_update(msg) for msg in messages_to_process]
-        await asyncio.gather(*tasks)
-        
-        return Response(content=f'Обработано {len(messages_to_process)} сообщений.', status_code=200)
-    except Exception as e:
-        logger.error(f"CRON: Критическая ошибка при обработке очереди: {e}")
+        logger.error(f"Ошибка в webhook FastAPI: {e}")
         return Response(status_code=500)
 
 @app.get("/")
 def index():
-    return "Bot webhook receiver is running..."
+    return "Bot is running..."
