@@ -21,7 +21,7 @@ from PIL import Image
 import fitz
 from upstash_redis import Redis
 
-# --- Настройка ---
+# --- Настройка (читает переменные окружения сервера) ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
@@ -29,7 +29,7 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10 
+HISTORY_LIMIT = 10
 
 # --- Подключение к Upstash Redis ---
 redis_client = None
@@ -56,22 +56,29 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
 # --- Вспомогательные функции ---
+async def send_long_message(update: Update, text: str):
+    if not text.strip(): return
+    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        await update.message.reply_text(text)
+    else:
+        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
+            await update.message.reply_text(text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH])
+            await asyncio.sleep(0.5)
 
 async def handle_gemini_response_stream(update: Update, response_stream):
-    """Обрабатывает потоковый ответ от Gemini, редактируя сообщение в реальном времени."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
-    update_interval = 0.7  # Секунды
+    update_interval = 0.8
 
     try:
-        # Отправляем начальное сообщение-заготовку
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
 
@@ -83,23 +90,40 @@ async def handle_gemini_response_stream(update: Update, response_stream):
                     try:
                         await placeholder_message.edit_text(full_response_text + " ✍️")
                         last_update_time = current_time
-                    except telegram.error.BadRequest: # Игнорируем ошибку, если текст не изменился
+                    except telegram.error.BadRequest:
                         pass
         
-        # Убираем индикатор "печатает" в финальном сообщении
         if placeholder_message and full_response_text:
             await placeholder_message.edit_text(full_response_text)
         
-        # Обновляем историю после получения полного ответа
         update_history(update.effective_user.id, update.message.text, full_response_text)
 
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        if placeholder_message:
-            await placeholder_message.edit_text(f"Произошла ошибка при генерации ответа: {e}")
-        else:
-            await update.message.reply_text(f"Произошла ошибка при генерации ответа: {e}")
-
+        error_text = f"Произошла ошибка при генерации ответа: {e}"
+        if placeholder_message: await placeholder_message.edit_text(error_text)
+        else: await update.message.reply_text(error_text)
+        
+async def handle_gemini_response(update: Update, response):
+    try:
+        if not response.candidates:
+            await update.message.reply_text(f"⚠️ Запрос был заблокирован.\nПричина: {getattr(response.prompt_feedback, 'block_reason_message', 'Причина не указана.')}")
+            return
+        candidate = response.candidates[0]
+        if candidate.finish_reason.name != "STOP":
+            await update.message.reply_text(f"⚠️ Контент не может быть сгенерирован. Причина: `{candidate.finish_reason.name}`", parse_mode='Markdown')
+            return
+        if not candidate.content.parts:
+            await update.message.reply_text("Модель вернула пустой ответ.")
+            return
+        for part in candidate.content.parts:
+            if hasattr(part, 'text') and part.text:
+                await send_long_message(update, part.text)
+            elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
+                await update.message.reply_photo(photo=io.BytesIO(part.inline_data.data))
+    except Exception as e:
+        logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
+        await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
@@ -141,11 +165,24 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    keyboard = [
+        [InlineKeyboardButton("Gemini 2.5 Pro (Документы/Текст)", callback_data='gemini-2.5-pro')],
+        [InlineKeyboardButton("Gemini 1.5 Pro (Документы/Текст)", callback_data='gemini-1.5-pro')],
+        [InlineKeyboardButton("Gemini 2.5 Flash (Текст)", callback_data='gemini-2.5-flash')],
+        [InlineKeyboardButton("Gemini 1.5 Flash (Текст)", callback_data='gemini-1.5-flash')],
+        [InlineKeyboardButton("Nano Banana (Изображения)", callback_data='gemini-2.5-flash-image-preview')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('Выберите модель:', reply_markup=reply_markup)
 
 @restricted
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    selected_model = query.data
+    if redis_client: redis_client.set(f"user:{user_id}:model", selected_model)
+    await query.edit_message_text(text=f"Модель изменена на: {selected_model}. Я запомню ваш выбор.")
 
 @restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,16 +194,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = get_history(user_id)
         model = genai.GenerativeModel(model_name)
         
-        # Формируем контент для отправки, включая историю
-        content_with_history = [
-            {'role': h['role'], 'parts': h['parts']} for h in history
-        ]
+        content_with_history = [{'role': h['role'], 'parts': h['parts']} for h in history]
         content_with_history.append({'role': 'user', 'parts': [{'text': user_message}]})
 
-        # Запускаем генерацию в режиме stream=True
         response_stream = await model.generate_content_async(content_with_history, stream=True)
-        
-        # Передаем стрим в новый обработчик
         await handle_gemini_response_stream(update, response_stream)
         
     except Exception as e:
@@ -175,15 +206,93 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (вставьте сюда полный код функции handle_photo_message из предыдущего ответа)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    if model_name != 'gemini-2.5-flash-image-preview':
+        await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    caption = update.message.caption or "Опиши это изображение"
+    await update.message.reply_chat_action(telegram.constants.ChatAction.UPLOAD_PHOTO)
+    try:
+        photo_bytes = io.BytesIO()
+        await photo_file.download_to_memory(photo_bytes)
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        model_gemini = genai.GenerativeModel(model_name)
+        response = await model_gemini.generate_content_async([caption, img])
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке фото: {e}')
 
 @restricted
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (вставьте сюда полный код функции handle_document_message из предыдущего ответа)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    if model_name not in DOCUMENT_ANALYSIS_MODELS:
+        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
+        return
+    doc = update.message.document
+    caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
+    await update.message.reply_text(f"Получил файл: {doc.file_name}.\nНачинаю обработку...")
+    try:
+        doc_file = await doc.get_file()
+        file_bytes_io = io.BytesIO()
+        await doc_file.download_to_memory(file_bytes_io)
+        file_bytes_io.seek(0)
+        content_parts = [caption]
+        file_text_content = ""
+        if doc.mime_type == 'application/pdf':
+            pdf_document = fitz.open(stream=file_bytes_io.read(), filetype="pdf")
+            page_limit = 25 
+            num_pages = min(len(pdf_document), page_limit)
+            for page_num in range(num_pages):
+                page = pdf_document.load_page(page_num)
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_bytes))
+                content_parts.append(img)
+            pdf_document.close()
+            await update.message.reply_text(f"Отправляю первые {num_pages} страниц PDF в Gemini на анализ...")
+        elif doc.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            document = docx.Document(file_bytes_io)
+            for para in document.paragraphs:
+                file_text_content += para.text + "\n"
+            content_parts.append(file_text_content)
+        elif doc.mime_type == 'text/plain':
+            file_text_content = file_bytes_io.read().decode('utf-8')
+            content_parts.append(file_text_content)
+        else:
+            await update.message.reply_text(f"Извините, я пока не поддерживаю файлы типа {doc.mime_type}.")
+            return
+        model = genai.GenerativeModel(model_name)
+        response = await model.generate_content_async(content_parts)
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке документа: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
 
-# --- Точка входа для сервера ---
+# --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
-    # ... (код без изменений)
-    
+    logger.info("Создание и настройка приложения...")
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Регистрация всех наших обработчиков
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("clear", clear_history))
+    application.add_handler(CommandHandler("model", model_selection))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    supported_files_filter = filters.Document.PDF | filters.Document.DOCX | filters.Document.TXT
+    application.add_handler(MessageHandler(supported_files_filter, handle_document_message))
+
+    logger.info("Бот запущен и работает в режиме опроса...")
+    application.run_polling()
+
 if __name__ == "__main__":
-    # ... (код без изменений)
+    if not all([TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, ALLOWED_USER_IDS_STR, redis_client]):
+        logger.critical("Не все переменные окружения или подключения настроены! Бот не может запуститься.")
+    else:
+        main()
