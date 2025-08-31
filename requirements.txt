@@ -3,6 +3,3 @@ google-generativeai
 Pillow
 PyMuPDF
 upstash-redis
-fastapi
-uvicorn
-nest-asyncio
