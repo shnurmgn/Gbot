@@ -22,7 +22,7 @@ from PIL import Image
 import fitz
 from upstash_redis import Redis
 
-# --- Настройка ---
+# --- Настройка (читает переменные окружения сервера) ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
@@ -30,16 +30,17 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10 
+HISTORY_LIMIT = 10
 
-# --- Подключение к Upstash Redis ---
+# --- Подключение к Upstash Redis (ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
 redis_client = None
 try:
+    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
+    # Важно: upstash-redis сам декодирует ответы, вручную это делать не нужно.
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
@@ -67,19 +68,17 @@ def restricted(func):
 # --- Вспомогательные функции ---
 
 def update_usage_stats(user_id: int, usage_metadata):
-    """Обновляет статистику использования токенов в Redis."""
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
         total_tokens = usage_metadata.total_token_count
         today = datetime.utcnow().strftime('%Y-%m-%d')
         daily_key = f"usage:{user_id}:daily:{today}"
         redis_client.incrby(daily_key, total_tokens)
-        redis_client.expire(daily_key, 86400 * 2) # Храним 2 дня
-        
+        redis_client.expire(daily_key, 86400 * 2)
         this_month = datetime.utcnow().strftime('%Y-%m')
         monthly_key = f"usage:{user_id}:monthly:{this_month}"
         redis_client.incrby(monthly_key, total_tokens)
-        redis_client.expire(monthly_key, 86400 * 32) # Храним 32 дня
+        redis_client.expire(monthly_key, 86400 * 32)
     except Exception as e:
         logger.error(f"Ошибка обновления статистики использования: {e}")
 
@@ -108,17 +107,14 @@ async def handle_gemini_response(update: Update, response):
         if not candidate.content.parts:
             await update.message.reply_text("Модель вернула пустой ответ.")
             return
-        
         full_text = ""
         for part in candidate.content.parts:
             if hasattr(part, 'text') and part.text:
                 full_text += part.text
             elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
                 await update.message.reply_photo(photo=io.BytesIO(part.inline_data.data))
-        
         if full_text:
             await send_long_message(update, full_text)
-
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
@@ -129,11 +125,9 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     full_response_text = ""
     last_update_time = 0
     update_interval = 0.8
-
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
-
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
@@ -144,15 +138,12 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                         last_update_time = current_time
                     except telegram.error.BadRequest:
                         pass
-        
         if placeholder_message and full_response_text:
             await placeholder_message.edit_text(full_response_text)
         
-        # Обновляем историю и статистику после получения полного ответа
         update_history(update.effective_user.id, user_message_text, full_response_text)
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
-
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
         error_text = f"Произошла ошибка при генерации ответа: {e}"
@@ -200,7 +191,7 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if redis_client: redis_client.delete(f"history:{user_id}")
     await update.message.reply_text("Память очищена.")
-
+    
 @restricted
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -344,7 +335,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("model", model_selection))
@@ -355,7 +346,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     supported_files_filter = filters.Document.PDF | filters.Document.DOCX | filters.Document.TXT
     application.add_handler(MessageHandler(supported_files_filter, handle_document_message))
-    
+
     logger.info("Бот запущен и работает в режиме опроса...")
     application.run_polling()
 
