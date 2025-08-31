@@ -26,12 +26,28 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 
-TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10 
+# --- ИСПРАВЛЕНИЕ: ЯВНАЯ ИНИЦИАЛИЗАЦИЯ КЛИЕНТА KV ---
+# 1. Читаем все необходимые переменные из окружения вручную
+kv_url = os.environ.get('KV_URL')
+kv_rest_api_url = os.environ.get('KV_REST_API_URL')
+kv_rest_api_token = os.environ.get('KV_REST_API_TOKEN')
+kv_rest_api_read_only_token = os.environ.get('KV_REST_API_READ_ONLY_TOKEN')
 
-# --- ИСПРАВЛЕНИЕ: Создаем экземпляр клиента KV ---
-kv = VercelKV()
+# 2. Создаем клиент, только если все переменные найдены, и передаем их явно
+kv = None
+if kv_url and kv_rest_api_url and kv_rest_api_token and kv_rest_api_read_only_token:
+    try:
+        kv = VercelKV(
+            url=kv_url,
+            rest_api_url=kv_rest_api_url,
+            rest_api_token=kv_rest_api_token,
+            rest_api_read_only_token=kv_rest_api_read_only_token
+        )
+        logging.info("Успешно и ЯВНО подключено к Vercel KV.")
+    except Exception as e:
+        logging.error(f"Не удалось подключиться к KV с явными параметрами: {e}")
+else:
+    logging.error("Не найдены все необходимые переменные окружения для Vercel KV.")
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -59,11 +75,11 @@ def restricted(func):
 # --- Вспомогательные функции ---
 async def send_long_message(update: Update, text: str):
     if not text.strip(): return
-    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+    if len(text) <= 4096:
         await update.message.reply_text(text)
     else:
-        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
-            chunk = text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
+        for i in range(0, len(text), 4096):
+            chunk = text[i:i + 4096]
             await update.message.reply_text(chunk)
             await asyncio.sleep(0.5)
 
@@ -111,6 +127,7 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа от модели: {e}")
 
 def get_history(user_id: int) -> list:
+    if not kv: return []
     try:
         history_json = kv.get(f"history:{user_id}")
         return json.loads(history_json) if history_json else []
@@ -119,9 +136,10 @@ def get_history(user_id: int) -> list:
         return []
 
 def update_history(user_id: int, chat_history: list):
+    if not kv: return
     history_to_save = [{'role': p.role, 'parts': [part.text for part in p.parts]} for p in chat_history]
-    if len(history_to_save) > HISTORY_LIMIT:
-        history_to_save = history_to_save[-HISTORY_LIMIT:]
+    if len(history_to_save) > 10:
+        history_to_save = history_to_save[-10:]
     try:
         kv.set(f"history:{user_id}", json.dumps(history_to_save))
     except Exception as e:
@@ -129,6 +147,7 @@ def update_history(user_id: int, chat_history: list):
 
 def get_user_model(user_id: int) -> str:
     default_model = 'gemini-1.5-flash'
+    if not kv: return default_model
     try:
         return kv.get(f"user:{user_id}:model") or default_model
     except Exception as e:
@@ -147,6 +166,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if not kv:
+        await update.message.reply_text("Хранилище не подключено.")
+        return
     try:
         kv.delete(f"history:{user_id}")
         logger.info(f"История для пользователя {user_id} очищена.")
@@ -173,10 +195,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
     selected_model = query.data
+    
+    if not kv:
+        await query.edit_message_text(text="Хранилище не настроено.")
+        return
+
     try:
         kv.set(f"user:{user_id}:model", selected_model)
         message_text = f"Модель изменена на: {selected_model}. Я запомню ваш выбор."
-        if selected_model in DOCUMENT_ANALYSIS_MODELS:
+        if selected_model in ['gemini-1.5-pro', 'gemini-2.5-pro']:
             message_text += "\n\nЭта модель отлично подходит для анализа PDF."
         await query.edit_message_text(text=message_text)
     except Exception as e:
@@ -188,6 +215,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
     model_name = get_user_model(user_id)
+            
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
         history = get_history(user_id)
@@ -228,11 +256,11 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     user_id = update.effective_user.id
     model_name = get_user_model(user_id)
     if model_name not in DOCUMENT_ANALYSIS_MODELS:
-        await update.message.reply_text(f"Для анализа PDF, пожалуйста, выберите модель Pro (например, Gemini 2.5 Pro) через команду /model.")
+        await update.message.reply_text(f"Для анализа PDF, пожалуйста, выберите модель Pro...")
         return
     doc_file = await update.message.document.get_file()
     caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
-    await update.message.reply_text(f"Получил PDF: {update.message.document.file_name}.\nНачинаю обработку...")
+    await update.message.reply_text(f"Получил PDF: {update.message.document.file_name}...")
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
         pdf_bytes = io.BytesIO()
