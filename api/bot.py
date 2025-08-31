@@ -21,7 +21,8 @@ import fitz
 from upstash_redis import Redis
 import nest_asyncio
 
-# Применяем патч asyncio в самом начале
+# --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: ПРИМЕНЯЕМ ПАТЧ ASYNCIO ---
+# Это должно быть в самом начале, до создания любых асинхронных объектов
 nest_asyncio.apply()
 
 # --- Настройка ---
@@ -272,7 +273,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Ошибка при обработке PDF: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке PDF: {e}')
 
-# --- ТОЧКА ВХОДА ДЛЯ VERCEL НА FASTAPI ---
+# --- Точка входа для Vercel ---
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clear", clear_history))
@@ -293,7 +294,6 @@ async def webhook(request: Request):
     """Асинхронная точка входа для Vercel."""
     try:
         update_data = await request.json()
-        # Мы не используем asyncio.run() здесь, так как FastAPI уже управляет циклом
         await process_update_async(update_data)
         return Response(status_code=200)
     except Exception as e:
