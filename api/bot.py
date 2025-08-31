@@ -5,7 +5,7 @@ import os
 from functools import wraps
 import json
 import google.generativeai as genai
-from flask import Flask, request, Response
+from fastapi import FastAPI, Request, Response
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,8 +21,7 @@ import fitz
 from upstash_redis import Redis
 import nest_asyncio
 
-# --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: ПРИМЕНЯЕМ ПАТЧ ASYNCIO ---
-# Это должно быть в самом начале, до создания любых асинхронных объектов
+# Применяем патч asyncio в самом начале
 nest_asyncio.apply()
 
 # --- Настройка ---
@@ -273,7 +272,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Ошибка при обработке PDF: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке PDF: {e}')
 
-# --- Точка входа для Vercel ---
+# --- ТОЧКА ВХОДА ДЛЯ VERCEL НА FASTAPI ---
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("clear", clear_history))
@@ -282,21 +281,21 @@ application.add_handler(CallbackQueryHandler(button_callback))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 application.add_handler(MessageHandler(filters.Document.PDF, handle_document_message))
-app = Flask(__name__)
+app = FastAPI()
 
 async def process_update_async(update_data):
     async with application:
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
 
-@app.route('/api/bot', methods=['POST'])
-def webhook():
-    """
-    Финальная версия с nest_asyncio: возвращаемся к asyncio.run()
-    """
+@app.post("/api/bot")
+async def webhook(request: Request):
+    """Асинхронная точка входа для Vercel."""
     try:
-        asyncio.run(process_update_async(request.get_json(force=True)))
-        return Response('ok', status=200)
+        update_data = await request.json()
+        # Мы не используем asyncio.run() здесь, так как FastAPI уже управляет циклом
+        await process_update_async(update_data)
+        return Response(status_code=200)
     except Exception as e:
-        logger.error(f"Ошибка в webhook: {e}")
-        return Response('error', status=500)
+        logger.error(f"Ошибка в webhook FastAPI: {e}")
+        return Response(status_code=500)
