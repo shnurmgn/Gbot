@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 from PIL import Image
 import fitz
-from vercel_kv import KV # <-- ИСПРАВЛЕНИЕ: импортируем KV в верхнем регистре
+from vercel_kv import KV
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -120,7 +120,7 @@ def update_history(user_id: int, chat_history: list):
     if len(history_to_save) > HISTORY_LIMIT:
         history_to_save = history_to_save[-HISTORY_LIMIT:]
     try:
-        KV.set(f"history:{user_id}", json.dumps(history_to_save))
+        KV.set(key=f"history:{user_id}", value=json.dumps(history_to_save))
     except Exception as e:
         logger.error(f"Ошибка сохранения истории в KV для user_id {user_id}: {e}")
 
@@ -171,7 +171,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     selected_model = query.data
     try:
-        KV.set(f"user:{user_id}:model", selected_model)
+        KV.set(key=f"user:{user_id}:model", value=selected_model)
         message_text = f"Модель изменена на: {selected_model}. Я запомню ваш выбор."
         if selected_model in DOCUMENT_ANALYSIS_MODELS:
             message_text += "\n\nЭта модель отлично подходит для анализа PDF."
