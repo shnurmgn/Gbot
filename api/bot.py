@@ -3,8 +3,8 @@ import asyncio
 import io
 import os
 from functools import wraps
+import json
 import google.generativeai as genai
-from google.generativeai import protos
 from flask import Flask, request, Response
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,6 +18,7 @@ from telegram.ext import (
 )
 from PIL import Image
 import fitz
+import redis # Используем Redis для Upstash
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -27,6 +28,17 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
+HISTORY_LIMIT = 10 # Лимит на количество сообщений в истории (5 пар)
+
+# --- Настройка подключения к Upstash Redis ---
+UPSTASH_URL = os.environ.get('UPSTASH_REDIS_REST_URL')
+UPSTASH_TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN')
+redis_client = None
+if UPSTASH_URL and UPSTASH_TOKEN:
+    try:
+        redis_client = redis.Redis.from_url(UPSTASH_URL, token=UPSTASH_TOKEN)
+    except Exception as e:
+        logging.error(f"Не удалось подключиться к Redis: {e}")
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -53,9 +65,8 @@ def restricted(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-# --- Вспомогательные функции (без изменений) ---
+# --- Вспомогательные функции ---
 async def send_long_message(update: Update, text: str):
-    # ... (код функции без изменений)
     if not text.strip(): return
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
         await update.message.reply_text(text)
@@ -66,7 +77,6 @@ async def send_long_message(update: Update, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
-    # ... (код функции без изменений)
     try:
         if not response.candidates:
             prompt_feedback = response.prompt_feedback
@@ -109,19 +119,65 @@ async def handle_gemini_response(update: Update, response):
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа от модели: {e}")
 
+def get_user_model(user_id: int) -> str:
+    """Получает сохраненную модель пользователя из Redis."""
+    default_model = 'gemini-1.5-flash'
+    if not redis_client:
+        return default_model
+    try:
+        stored_model = redis_client.get(f"user:{user_id}:model")
+        return stored_model.decode('utf-8') if stored_model else default_model
+    except Exception as e:
+        logger.error(f"Ошибка чтения модели из Redis для user_id {user_id}: {e}")
+        return default_model
 
-# --- Функции-обработчики (без изменений) ---
+def get_history(user_id: int) -> list:
+    """Получает историю диалога для пользователя из Redis."""
+    if not redis_client: return []
+    try:
+        history_json = redis_client.get(f"history:{user_id}")
+        return json.loads(history_json) if history_json else []
+    except Exception as e:
+        logger.error(f"Ошибка чтения истории из Redis для user_id {user_id}: {e}")
+        return []
+
+def update_history(user_id: int, chat_history: list):
+    """Обновляет историю диалога в Redis, обрезая старые сообщения."""
+    if not redis_client: return
+    # Обрезаем историю, оставляя только последние HISTORY_LIMIT сообщений
+    if len(chat_history) > HISTORY_LIMIT:
+        chat_history = chat_history[-HISTORY_LIMIT:]
+    try:
+        # Устанавливаем время жизни для записи (24 часа), чтобы база не переполнялась
+        redis_client.set(f"history:{user_id}", json.dumps([{'role': p.role, 'parts': [part.text for part in p.parts]} for p in chat_history]), ex=86400)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения истории в Redis для user_id {user_id}: {e}")
+
+# --- Функции-обработчики ---
+
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код функции без изменений)
     user = update.effective_user
-    context.user_data.setdefault('model_name', 'gemini-1.5-flash')
+    model_name = get_user_model(user.id)
     await update.message.reply_html(rf"Привет, {user.mention_html()}!")
-    await update.message.reply_text(f"Я бот, подключенный к Gemini...")
+    await update.message.reply_text(f"Я бот, подключенный к Gemini.\nТекущая модель: {model_name}.\n\nЧтобы начать новый диалог и очистить мою память, используйте команду /clear.")
+
+@restricted
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not redis_client:
+        await update.message.reply_text("Хранилище не подключено.")
+        return
+    try:
+        redis_client.delete(f"history:{user_id}")
+        logger.info(f"История для пользователя {user_id} очищена.")
+        await update.message.reply_text("Память очищена. Начинаем новый диалог!")
+    except Exception as e:
+        logger.error(f"Ошибка очистки истории в Redis для user_id {user_id}: {e}")
+        await update.message.reply_text("Не удалось очистить историю.")
 
 @restricted
 async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код функции без изменений)
     keyboard = [
         [InlineKeyboardButton("Gemini 2.5 Pro (Документы/Текст)", callback_data='gemini-2.5-pro')],
         [InlineKeyboardButton("Gemini 1.5 Pro (Документы/Текст)", callback_data='gemini-1.5-pro')],
@@ -134,36 +190,48 @@ async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код функции без изменений)
     query = update.callback_query
+    user_id = query.from_user.id
     await query.answer()
     selected_model = query.data
-    context.user_data['model_name'] = selected_model
-    message_text = f"Модель изменена на: {selected_model}"
-    if selected_model == 'gemini-2.5-flash-image-preview':
-        message_text = "Выбрана модель 'Nano Banana'..."
-    elif selected_model in DOCUMENT_ANALYSIS_MODELS:
-         message_text += ".\n\nЭта модель отлично подходит для анализа PDF..."
+    
+    if redis_client:
+        try:
+            redis_client.set(f"user:{user_id}:model", selected_model)
+            message_text = f"Модель изменена на: {selected_model}. Я запомню ваш выбор."
+        except Exception as e:
+            logger.error(f"Ошибка сохранения модели в Redis: {e}")
+            message_text = "Не удалось сохранить ваш выбор."
+    else:
+        message_text = "Хранилище данных не настроено."
+    
+    if selected_model in DOCUMENT_ANALYSIS_MODELS:
+         message_text += "\n\nЭта модель отлично подходит для анализа PDF."
+         
     await query.edit_message_text(text=message_text)
 
 @restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код функции без изменений)
+    user_id = update.effective_user.id
     user_message = update.message.text
-    model_name = context.user_data.get('model_name', 'gemini-1.5-flash')
+    model_name = get_user_model(user_id)
+            
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
+        history = get_history(user_id)
         model = genai.GenerativeModel(model_name)
-        response = model.generate_content(user_message)
+        chat = model.start_chat(history=history)
+        response = await chat.send_message_async(user_message)
+        update_history(user_id, chat.history)
         await handle_gemini_response(update, response)
     except Exception as e:
-        logger.error(f"Ошибка при обработке текстового сообщения: {e}")
+        logger.error(f"Ошибка при обработке текстового сообщения с историей: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код функции без изменений)
-    model_name = context.user_data.get('model_name', 'gemini-1.5-flash')
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
     if model_name != 'gemini-2.5-flash-image-preview':
         await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
         return
@@ -185,8 +253,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @restricted
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код функции без изменений)
-    model_name = context.user_data.get('model_name', 'gemini-1.5-flash')
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
     if model_name not in DOCUMENT_ANALYSIS_MODELS:
         await update.message.reply_text(f"Для анализа PDF, выберите модель Pro...")
         return
@@ -223,33 +291,28 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Ошибка при обработке PDF: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке PDF: {e}')
 
+
 # --- Точка входа для Vercel ---
 
-# 1. Создаем объект приложения
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-# 2. Регистрируем все наши обработчики
 application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("clear", clear_history))
 application.add_handler(CommandHandler("model", model_selection))
 application.add_handler(CallbackQueryHandler(button_callback))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 application.add_handler(MessageHandler(filters.Document.PDF, handle_document_message))
 
-# 3. Создаем Flask-приложение
 app = Flask(__name__)
 
-# 4. Создаем асинхронную функцию для обработки обновлений
 async def process_update_async(update_data):
-    # Используем async with для правильной инициализации и закрытия
     async with application:
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
 
-# 5. Создаем синхронную точку входа для Vercel
 @app.route('/api/bot', methods=['POST'])
 def webhook():
-    """Эта функция вызывается Vercel'ом и запускает асинхронную обработку."""
     try:
         asyncio.run(process_update_async(request.get_json(force=True)))
         return Response('ok', status=200)
