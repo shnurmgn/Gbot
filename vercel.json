@@ -10,11 +10,5 @@
       "src": "/api/(.*)",
       "dest": "api/bot.py"
     }
-  ],
-  "crons": [
-    {
-      "path": "/api/process-queue?cron_secret=MySuperSecretCronKey123",
-      "schedule": "* * * * *"
-    }
   ]
 }
