@@ -29,13 +29,13 @@ TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 HISTORY_LIMIT = 10
 
-# --- Подключение к Upstash Redis ---
+# --- Подключение к Upstash Redis (С ИСПРАВЛЕНИЕМ) ---
 redis_client = None
 try:
+    # Убираем лишний параметр decode_responses=True
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
