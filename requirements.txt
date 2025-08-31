@@ -2,6 +2,7 @@ python-telegram-bot
 google-generativeai
 Pillow
 PyMuPDF
-Flask
 upstash-redis
 nest-asyncio
+fastapi
+uvicorn
