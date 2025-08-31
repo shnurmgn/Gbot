@@ -58,7 +58,6 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
-            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа к этому боту.", show_alert=True)
             return
@@ -81,14 +80,12 @@ async def handle_gemini_response(update: Update, response):
         if not response.candidates:
             prompt_feedback = response.prompt_feedback
             block_reason = getattr(prompt_feedback, 'block_reason_message', 'Причина не указана.')
-            logger.warning(f"Запрос полностью заблокирован. Причина: {block_reason}. Полный ответ: {response}")
             await update.message.reply_text(f"⚠️ Запрос был заблокирован.\nПричина: {block_reason}")
             return
 
         candidate = response.candidates[0]
         if candidate.finish_reason.name != "STOP":
             finish_reason_name = candidate.finish_reason.name
-            logger.warning(f"Генерация остановлена по причине: {finish_reason_name}. Полный ответ: {response}")
             safety_info = []
             for rating in candidate.safety_ratings:
                 if rating.probability.name in ["MEDIUM", "HIGH"]:
@@ -103,7 +100,6 @@ async def handle_gemini_response(update: Update, response):
             return
 
         if not candidate.content.parts:
-            logger.warning(f"Gemini вернул пустой ответ без контента. Полный ответ: {response}")
             await update.message.reply_text("Модель вернула пустой ответ.")
             return
 
@@ -113,8 +109,6 @@ async def handle_gemini_response(update: Update, response):
             elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
                 image_data = part.inline_data.data
                 await update.message.reply_photo(photo=io.BytesIO(image_data))
-            else:
-                logger.warning(f"Получена неизвестная часть ответа: {part}")
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа от модели: {e}")
@@ -308,18 +302,10 @@ async def process_update_async(update_data):
 @app.route('/api/bot', methods=['POST'])
 def webhook():
     """
-    Финальная, наиболее стабильная версия точки входа для Vercel.
+    Финальная, каноническая версия точки входа для Vercel.
     """
     try:
-        # Пытаемся получить существующий цикл событий
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        # Если его нет, создаем новый и устанавливаем его как текущий
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    try:
-        loop.run_until_complete(process_update_async(request.get_json(force=True)))
+        asyncio.run(process_update_async(request.get_json(force=True)))
         return Response('ok', status=200)
     except Exception as e:
         logger.error(f"Ошибка в webhook: {e}")
