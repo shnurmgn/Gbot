@@ -13,8 +13,9 @@
   ],
   "crons": [
     {
-      "path": "/api/bot?cron_secret=ВАШ_СЕКРЕТНЫЙ_КЛЮЧ",
+      "path": "/api/bot?cron_secret="MySuperSecretCronKey123",
       "schedule": "* * * * *"
     }
   ]
 }
+
