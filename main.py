@@ -7,6 +7,7 @@ from functools import wraps
 import json
 import docx
 import google.generativeai as genai
+from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,7 +22,7 @@ from PIL import Image
 import fitz
 from upstash_redis import Redis
 
-# --- Настройка (читает переменные окружения сервера) ---
+# --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
@@ -29,15 +30,15 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
-HISTORY_LIMIT = 10
+HISTORY_LIMIT = 10 
 
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # Версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -64,6 +65,24 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
+
+def update_usage_stats(user_id: int, usage_metadata):
+    """Обновляет статистику использования токенов в Redis."""
+    if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
+    try:
+        total_tokens = usage_metadata.total_token_count
+        today = datetime.utcnow().strftime('%Y-%m-%d')
+        daily_key = f"usage:{user_id}:daily:{today}"
+        redis_client.incrby(daily_key, total_tokens)
+        redis_client.expire(daily_key, 86400 * 2) # Храним 2 дня
+        
+        this_month = datetime.utcnow().strftime('%Y-%m')
+        monthly_key = f"usage:{user_id}:monthly:{this_month}"
+        redis_client.incrby(monthly_key, total_tokens)
+        redis_client.expire(monthly_key, 86400 * 32) # Храним 32 дня
+    except Exception as e:
+        logger.error(f"Ошибка обновления статистики использования: {e}")
+
 async def send_long_message(update: Update, text: str):
     if not text.strip(): return
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -74,7 +93,11 @@ async def send_long_message(update: Update, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    """Обрабатывает НЕ-стриминговые ответы (фото, документы)."""
     try:
+        if hasattr(response, 'usage_metadata'):
+            update_usage_stats(update.effective_user.id, response.usage_metadata)
+        
         if not response.candidates:
             await update.message.reply_text(f"⚠️ Запрос был заблокирован.\nПричина: {getattr(response.prompt_feedback, 'block_reason_message', 'Причина не указана.')}")
             return
@@ -85,19 +108,23 @@ async def handle_gemini_response(update: Update, response):
         if not candidate.content.parts:
             await update.message.reply_text("Модель вернула пустой ответ.")
             return
+        
         full_text = ""
         for part in candidate.content.parts:
             if hasattr(part, 'text') and part.text:
                 full_text += part.text
             elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
                 await update.message.reply_photo(photo=io.BytesIO(part.inline_data.data))
+        
         if full_text:
             await send_long_message(update, full_text)
+
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
-async def handle_gemini_response_stream(update: Update, response_stream):
+async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
+    """Обрабатывает потоковый ответ от Gemini, редактируя сообщение в реальном времени."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -108,7 +135,7 @@ async def handle_gemini_response_stream(update: Update, response_stream):
         last_update_time = time.time()
 
         async for chunk in response_stream:
-            if chunk.text:
+            if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
                 current_time = time.time()
                 if current_time - last_update_time > update_interval:
@@ -121,8 +148,10 @@ async def handle_gemini_response_stream(update: Update, response_stream):
         if placeholder_message and full_response_text:
             await placeholder_message.edit_text(full_response_text)
         
-        # Обновляем историю после получения полного ответа
-        update_history(update.effective_user.id, update.message.text, full_response_text)
+        # Обновляем историю и статистику после получения полного ответа
+        update_history(update.effective_user.id, user_message_text, full_response_text)
+        if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
+            update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
 
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
@@ -154,6 +183,10 @@ def get_user_model(user_id: int) -> str:
         return stored_model if stored_model else default_model
     except Exception: return default_model
 
+def get_user_persona(user_id: int) -> str:
+    if not redis_client: return None
+    return redis_client.get(f"persona:{user_id}")
+
 # --- Функции-обработчики ---
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,6 +200,37 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if redis_client: redis_client.delete(f"history:{user_id}")
     await update.message.reply_text("Память очищена.")
+
+@restricted
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not redis_client:
+        await update.message.reply_text("Хранилище не подключено, статистика недоступна.")
+        return
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    this_month = datetime.utcnow().strftime('%Y-%m')
+    daily_tokens = redis_client.get(f"usage:{user_id}:daily:{today}") or 0
+    monthly_tokens = redis_client.get(f"usage:{user_id}:monthly:{this_month}") or 0
+    await update.message.reply_text(
+        f"📊 **Статистика использования токенов:**\n\n"
+        f"Сегодня ({today}):\n`{int(daily_tokens):,}` токенов\n\n"
+        f"В этом месяце ({this_month}):\n`{int(monthly_tokens):,}` токенов",
+        parse_mode='Markdown'
+    )
+
+@restricted
+async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    persona_text = " ".join(context.args) if context.args else None
+    if not redis_client:
+        await update.message.reply_text("Хранилище не подключено, не могу сохранить персону.")
+        return
+    if persona_text:
+        redis_client.set(f"persona:{user_id}", persona_text)
+        await update.message.reply_text(f"✅ Новая персона установлена:\n\n_{persona_text}_", parse_mode='Markdown')
+    else:
+        redis_client.delete(f"persona:{user_id}")
+        await update.message.reply_text("🗑️ Персона сброшена до стандартной.")
 
 @restricted
 async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,17 +258,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
     model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
         history = get_history(user_id)
-        model = genai.GenerativeModel(model_name)
-        
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
         content_with_history = [{'role': h['role'], 'parts': h['parts']} for h in history]
         content_with_history.append({'role': 'user', 'parts': [{'text': user_message}]})
-
         response_stream = await model.generate_content_async(content_with_history, stream=True)
-        await handle_gemini_response_stream(update, response_stream)
-        
+        await handle_gemini_response_stream(update, response_stream, user_message)
     except Exception as e:
         logger.error(f"Ошибка при обработке текстового сообщения со стримингом: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
@@ -213,6 +275,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
     if model_name != 'gemini-2.5-flash-image-preview':
         await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
         return
@@ -224,7 +287,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await photo_file.download_to_memory(photo_bytes)
         photo_bytes.seek(0)
         img = Image.open(photo_bytes)
-        model_gemini = genai.GenerativeModel(model_name)
+        model_gemini = genai.GenerativeModel(model_name, system_instruction=persona)
         response = await model_gemini.generate_content_async([caption, img])
         await handle_gemini_response(update, response)
     except Exception as e:
@@ -235,6 +298,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
     if model_name not in DOCUMENT_ANALYSIS_MODELS:
         await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
         return
@@ -247,7 +311,6 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await doc_file.download_to_memory(file_bytes_io)
         file_bytes_io.seek(0)
         content_parts = [caption]
-        file_text_content = ""
         if doc.mime_type == 'application/pdf':
             pdf_document = fitz.open(stream=file_bytes_io.read(), filetype="pdf")
             page_limit = 25 
@@ -262,8 +325,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text(f"Отправляю первые {num_pages} страниц PDF в Gemini на анализ...")
         elif doc.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
             document = docx.Document(file_bytes_io)
-            for para in document.paragraphs:
-                file_text_content += para.text + "\n"
+            file_text_content = "\n".join([para.text for para in document.paragraphs])
             content_parts.append(file_text_content)
         elif doc.mime_type == 'text/plain':
             file_text_content = file_bytes_io.read().decode('utf-8')
@@ -271,7 +333,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         else:
             await update.message.reply_text(f"Извините, я пока не поддерживаю файлы типа {doc.mime_type}.")
             return
-        model = genai.GenerativeModel(model_name)
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
         response = await model.generate_content_async(content_parts)
         await handle_gemini_response(update, response)
     except Exception as e:
@@ -282,17 +344,18 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Регистрация всех наших обработчиков
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("model", model_selection))
+    application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("persona", persona_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     supported_files_filter = filters.Document.PDF | filters.Document.DOCX | filters.Document.TXT
     application.add_handler(MessageHandler(supported_files_filter, handle_document_message))
-
+    
     logger.info("Бот запущен и работает в режиме опроса...")
     application.run_polling()
 
