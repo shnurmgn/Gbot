@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -65,6 +65,7 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
+
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -227,10 +228,6 @@ async def get_chats_submenu_text_and_keyboard():
 @restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Принудительно удаляем старую клавиатуру, отправив "пустое" сообщение с ReplyKeyboardRemove
-    await update.message.reply_text("Загрузка...", reply_markup=ReplyKeyboardRemove())
-    
-    # Теперь показываем новое инлайн-меню
     await update.message.reply_html(rf"Привет, {user.mention_html()}!")
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user.id)
     await update.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -438,17 +435,97 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    user_message = update.message.text
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+    try:
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
+        if model_name in IMAGE_GEN_MODELS:
+            image_prompt = f"Generate a high-quality, photorealistic image of: {user_message}"
+            response = await model.generate_content_async(image_prompt)
+            await handle_gemini_response(update, response)
+            update_history(user_id, user_message, "[Запрос на генерацию изображения]")
+        else:
+            history = get_history(user_id)
+            chat = model.start_chat(history=history)
+            response_stream = await chat.send_message_async(user_message, stream=True)
+            await handle_gemini_response_stream(update, response_stream, user_message)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке текстового сообщения: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in IMAGE_GEN_MODELS:
+        await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    caption = update.message.caption or "Опиши это изображение"
+    await update.message.reply_chat_action(telegram.constants.ChatAction.UPLOAD_PHOTO)
+    try:
+        photo_bytes = io.BytesIO()
+        await photo_file.download_to_memory(photo_bytes)
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        model_gemini = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model_gemini.generate_content_async([caption, img])
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке фото: {e}')
 
 @restricted
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in DOCUMENT_ANALYSIS_MODELS:
+        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
+        return
+    doc = update.message.document
+    caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
+    await update.message.reply_text(f"Получил файл: {doc.file_name}.\nНачинаю обработку...")
+    try:
+        doc_file = await doc.get_file()
+        file_bytes_io = io.BytesIO()
+        await doc_file.download_to_memory(file_bytes_io)
+        file_bytes_io.seek(0)
+        content_parts = [caption]
+        if doc.mime_type == 'application/pdf':
+            pdf_document = fitz.open(stream=file_bytes_io.read(), filetype="pdf")
+            page_limit = 25 
+            num_pages = min(len(pdf_document), page_limit)
+            for page_num in range(num_pages):
+                page = pdf_document.load_page(page_num)
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_bytes))
+                content_parts.append(img)
+            pdf_document.close()
+            await update.message.reply_text(f"Отправляю первые {num_pages} страниц PDF в Gemini на анализ...")
+        elif doc.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            document = docx.Document(file_bytes_io)
+            file_text_content = "\n".join([para.text for para in document.paragraphs])
+            content_parts.append(file_text_content)
+        elif doc.mime_type == 'text/plain':
+            file_text_content = file_bytes_io.read().decode('utf-8')
+            content_parts.append(file_text_content)
+        else:
+            await update.message.reply_text(f"Извините, я пока не поддерживаю файлы типа {doc.mime_type}.")
+            return
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model.generate_content_async(content_parts)
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке документа: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
 
-# --- Точка входа для сервера ---
+# --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
