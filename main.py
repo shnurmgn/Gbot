@@ -17,8 +17,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    Defaults,
 )
+from telegram.request import HTTPXRequest
 from PIL import Image
 import fitz
 from upstash_redis import Redis
@@ -262,12 +262,13 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_message = update.callback_query.message if update.callback_query else update.message
     
     try:
-        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except (AttributeError, telegram.error.BadRequest):
-        if update.message:
-            try: await update.message.delete()
-            except: pass
-        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        if target_message:
+            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" not in str(e):
+             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
@@ -602,7 +603,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     
-    defaults = Defaults(connect_timeout=20, read_timeout=20, write_timeout=20)
+    defaults = Defaults(connect_timeout=20, read_timeout=30, write_timeout=30)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).defaults(defaults).build()
     
     application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
