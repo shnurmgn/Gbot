@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -65,7 +65,6 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
-
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -226,29 +225,35 @@ async def get_chats_submenu_text_and_keyboard():
     return text, InlineKeyboardMarkup(keyboard)
 
 @restricted
-async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает /start, принудительно убирает старую клавиатуру и показывает новую."""
+    user = update.effective_user
+    # Принудительно удаляем старую клавиатуру, отправив сообщение с ReplyKeyboardRemove
+    await update.message.reply_text("Загрузка...", reply_markup=ReplyKeyboardRemove())
+    
+    # Теперь показываем новое инлайн-меню
+    await update.message.reply_html(rf"Привет, {user.mention_html()}!")
+    menu_text, reply_markup = await get_main_menu_text_and_keyboard(user.id)
+    await update.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+@restricted
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает или обновляет главное инлайн-меню."""
     user_id = update.effective_user.id
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     
-    # Удаляем сообщение с командой (/start или /menu) для чистоты
-    if update.message:
-        await update.message.delete()
-        
-    target_message = update.callback_query.message if update.callback_query else None
+    target_message = update.callback_query.message if update.callback_query else update.message
     
     # Пытаемся отредактировать. Если не получается - отправляем новое сообщение.
     try:
-        if target_message:
-            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except telegram.error.BadRequest as e:
-        if "Message is not modified" not in str(e):
-             # Если ошибка не "сообщение не изменилось", отправляем новое
-             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-
+        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except (AttributeError, telegram.error.BadRequest):
+        if update.message:
+            await update.message.delete()
+        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
+    """Логика очистки истории, для вызова из команды и кнопки."""
     user_id = update.effective_user.id
     active_chat = get_active_chat_name(user_id)
     if redis_client: redis_client.delete(f"history:{user_id}:{active_chat}")
@@ -411,7 +416,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(submenu_text, reply_markup=reply_markup, parse_mode='Markdown')
         elif payload == "clear":
             response_text = await clear_history_logic(update)
+            # Отправляем подтверждение как новое сообщение, чтобы оно не исчезло
             await query.message.reply_text(response_text, parse_mode='Markdown')
+            # Обновляем главное меню
             await menu_command(update, context)
         elif payload == "usage":
             await usage_command(update, context, from_callback=True)
@@ -468,7 +475,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     model_name = get_user_model(user_id)
     persona = get_user_persona(user_id)
     if model_name not in IMAGE_GEN_MODELS:
-        await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
+        await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /menu.")
         return
     photo_file = await update.message.photo[-1].get_file()
     caption = update.message.caption or "Опиши это изображение"
@@ -491,7 +498,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     model_name = get_user_model(user_id)
     persona = get_user_persona(user_id)
     if model_name not in DOCUMENT_ANALYSIS_MODELS:
-        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
+        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro через /menu.")
         return
     doc = update.message.document
     caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
@@ -536,7 +543,8 @@ def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("menu", main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("persona", persona_command))
