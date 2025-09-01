@@ -85,15 +85,25 @@ def update_usage_stats(user_id: int, usage_metadata):
         logger.error(f"Ошибка обновления статистики использования: {e}")
 
 async def send_long_message(message: telegram.Message, text: str):
+    """Надежно отправляет длинные сообщения, с фолбэком на простой текст при ошибке разметки."""
     if not text.strip(): return
-    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
-        await message.reply_text(text, parse_mode='Markdown')
-    else:
-        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
-            await message.reply_text(text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH], parse_mode='Markdown')
+    chunks = [text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH)]
+    
+    for i, chunk in enumerate(chunks):
+        try:
+            await message.reply_text(chunk, parse_mode='Markdown')
+        except telegram.error.BadRequest as e:
+            if "can't parse entities" in str(e):
+                logger.warning(f"Ошибка разметки Markdown. Повторная отправка как простой текст.")
+                await message.reply_text(chunk)
+            else:
+                logger.error(f"Неизвестная ошибка BadRequest: {e}")
+                await message.reply_text(f"Произошла ошибка при форматировании ответа: {e}")
+        if len(chunks) > 1 and i < len(chunks) - 1:
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -122,6 +132,7 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
+    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -136,6 +147,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                 if current_time - last_update_time > update_interval:
                     try:
                         if len(full_response_text) < TELEGRAM_MAX_MESSAGE_LENGTH - 10:
+                            # Редактируем без Markdown, чтобы избежать ошибок
                             await placeholder_message.edit_text(full_response_text + " ✍️")
                             last_update_time = current_time
                     except telegram.error.BadRequest:
@@ -185,6 +197,7 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
+        # upstash-redis v1+ сам декодирует ответы, decode не нужен
         return stored_model if stored_model else default_model
     except Exception: return default_model
 
@@ -233,25 +246,27 @@ async def get_chats_submenu_text_and_keyboard():
 
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает или обновляет главное инлайн-меню, удаляя старые клавиатуры."""
     user_id = update.effective_user.id
-    menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     
+    # Сначала отправляем сообщение с командой на удаление старой клавиатуры, если она была
     if update.message:
-        # Принудительно удаляем старую текстовую клавиатуру, если она есть
-        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Загрузка меню...", reply_markup=ReplyKeyboardRemove())
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
-        
-    target_message = update.callback_query.message if update.callback_query else update.message
+        if update.message.text.strip() in ["/start", "/menu"]:
+            await update.message.delete()
+    
+    menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
+    target_message = update.callback_query.message if update.callback_query else None
     
     try:
-        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except (AttributeError, telegram.error.BadRequest):
-        if update.message:
-            try:
-                await update.message.delete()
-            except telegram.error.BadRequest:
-                pass 
-        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        if target_message:
+            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" not in str(e):
+             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
@@ -614,3 +629,4 @@ if __name__ == "__main__":
         logger.critical("Не все переменные окружения или подключения настроены! Бот не может запуститься.")
     else:
         main()
+
