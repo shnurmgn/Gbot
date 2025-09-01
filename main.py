@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,13 +31,12 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
-HISTORY_LIMIT = 10
+HISTORY_LIMIT = 10 
 DEFAULT_CHAT_NAME = "default"
 
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # Версия без decode_responses, чтобы избежать ошибок со старыми версиями библиотеки
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN')
@@ -60,7 +59,6 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
-            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
@@ -68,7 +66,6 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
-
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -86,15 +83,27 @@ def update_usage_stats(user_id: int, usage_metadata):
 
 async def send_long_message(message: telegram.Message, text: str):
     if not text.strip(): return
+    chunks = []
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
-        await message.reply_text(text, parse_mode='Markdown')
+        chunks.append(text)
     else:
         for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
-            await message.reply_text(text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH], parse_mode='Markdown')
+            chunks.append(text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH])
+    
+    for i, chunk in enumerate(chunks):
+        try:
+            await message.reply_text(chunk, parse_mode='Markdown')
+        except telegram.error.BadRequest as e:
+            if "can't parse entities" in str(e):
+                logger.warning(f"Ошибка разметки Markdown. Повторная отправка как простой текст. Ошибка: {e}")
+                await message.reply_text(chunk)
+            else:
+                logger.error(f"Неизвестная ошибка BadRequest при отправке сообщения: {e}")
+                await message.reply_text(f"Произошла ошибка при форматировании ответа: {e}")
+        if len(chunks) > 1 and i < len(chunks) - 1:
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
-    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -123,7 +132,6 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
-    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -143,8 +151,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                     except telegram.error.BadRequest:
                         pass
         
-        if placeholder_message:
-            await placeholder_message.delete()
+        await placeholder_message.delete()
         
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
@@ -298,7 +305,7 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         redis_client.delete(f"persona:{user_id}")
         await update.message.reply_text("🗑️ Персона сброшена до стандартной.")
-
+        
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback: bool = False):
     """Отправляет сообщение со справкой о возможностях бота."""
