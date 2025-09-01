@@ -31,12 +31,13 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
-HISTORY_LIMIT = 10 
+HISTORY_LIMIT = 10
 DEFAULT_CHAT_NAME = "default"
 
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
+    # Версия без decode_responses, чтобы избежать ошибок со старыми версиями библиотеки
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN')
@@ -45,6 +46,7 @@ try:
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -58,6 +60,7 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
@@ -65,6 +68,7 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
+
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -90,6 +94,7 @@ async def send_long_message(message: telegram.Message, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -118,6 +123,7 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
+    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -137,7 +143,8 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                     except telegram.error.BadRequest:
                         pass
         
-        await placeholder_message.delete()
+        if placeholder_message:
+            await placeholder_message.delete()
         
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
@@ -232,21 +239,19 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     
-    # Удаляем сообщение с командой (/start или /menu), чтобы не засорять чат
     if update.message:
-        # Принудительно удаляем старую текстовую клавиатуру
-        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
+        await update.message.delete()
         
-    target_message = update.callback_query.message if update.callback_query else update.message
+    target_message = update.callback_query.message if update.callback_query else None
     
     try:
-        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except (AttributeError, telegram.error.BadRequest):
-        if update.message:
-            try: await update.message.delete()
-            except: pass
-        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        if target_message:
+            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" not in str(e):
+             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
@@ -293,32 +298,46 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         redis_client.delete(f"persona:{user_id}")
         await update.message.reply_text("🗑️ Персона сброшена до стандартной.")
-        
+
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback: bool = False):
-    help_text = (
-        "🤖 **Привет! Вот что я умею:**\n\n"
-        "Я ваш персональный ассистент на базе Google Gemini. Я могу общаться с вами, помнить контекст, генерировать и анализировать контент.\n\n"
-        "**Основные возможности:**\n\n"
-        "💬 **Диалог с памятью**\n"
-        "Просто общайтесь со мной. Я помню последние 10 сообщений, чтобы вы могли задавать уточняющие вопросы.\n\n"
-        "🖼️ **Работа с изображениями**\n"
-        "• **Генерация:** Выберите модель `Nano Banana` и попросите нарисовать что-нибудь (например, `нарисуй кота-астронавта`).\n"
-        "• **Анализ:** Отправьте мне фото с вопросом в подписи (например, `что на этой картинке?`).\n\n"
-        "📄 **Анализ документов**\n"
-        "Отправьте мне файл (`.pdf`, `.docx`, `.txt`) с задачей в подписи (например, `сделай краткую выжимку`). Для этого лучше всего подходят модели `Pro`.\n\n"
-        "**Команды управления:**\n"
-        "• `/menu` - Показать главное меню с кнопками.\n"
-        "• `/persona <текст>` - Установить мне личность. Пустая команда `/persona` сбрасывает ее.\n"
-        "• `/usage` - Посмотреть статистику использования токенов.\n"
-        "• `/clear` - Очистить историю текущего чата.\n\n"
-        "**Управление чатами:**\n"
-        "• `/new_chat` - Начать новый диалог.\n"
-        "• `/save_chat <имя>` - Сохранить текущий диалог.\n"
-        "• `/load_chat <имя>` - Вернуться к сохраненному разговору.\n"
-        "• `/chats` - Показать список ваших диалогов.\n"
-        "• `/delete_chat <имя>` - Удалить диалог."
-    )
+    """Отправляет сообщение со справкой о возможностях бота."""
+    help_text = """
+Я ваш персональный ассистент, подключенный к мощным нейросетям Google Gemini.
+
+💬 **Просто общайтесь со мной**
+Напишите любой вопрос или задачу, и я постараюсь помочь.
+Я помню контекст нашего диалога, так что вы можете задавать уточняющие вопросы (например, "а расскажи подробнее о втором пункте?").
+
+🤖 **Выбор 'мозга' (`/model`)**
+В главном меню вы можете выбрать модель ИИ, которая лучше всего подходит для вашей задачи: `Pro` для сложных текстов и анализа, `Flash` для быстрых ответов или `Nano Banana` для работы с изображениями. Ваш выбор сохраняется.
+
+👤 **Настройка личности (`/persona`)**
+Хотите, чтобы я отвечал в определенном стиле? Дайте мне инструкцию!
+Пример: `/persona Ты — пират, и в каждом ответе используешь морской жаргон.`
+Чтобы сбросить личность до стандартной, просто отправьте команду `/persona` без текста.
+
+🗂️ **Управление диалогами (Чаты)**
+Вы можете вести несколько независимых диалогов для разных проектов.
+• `/new_chat` — начать новый, чистый диалог.
+• `/save_chat <имя>` — сохранить текущий разговор под именем (например, `/save_chat идеи_для_отпуска`).
+• `/load_chat <имя>` — вернуться к сохраненному разговору.
+• `/chats` — посмотреть список всех ваших сохраненных диалогов.
+• `/delete_chat <имя>` — удалить сохраненный диалог.
+• `/clear` — очистить историю только текущего активного диалога.
+
+🖼️ **Работа с изображениями**
+• **Генерация:** Выберите модель "Nano Banana" и попросите меня что-нибудь нарисовать, написав текстом (например, `нарисуй кота в очках программиста`).
+• **Анализ/Редактирование:** Отправьте мне фотографию с подписью-инструкцией (например, `сделай это фото черно-белым` или `что изображено на этой картинке?`).
+
+📄 **Анализ документов**
+Отправьте мне файл (`.pdf`, `.docx` или `.txt`) с вопросом в подписи (например, `сделай краткую выжимку этого отчета на 5 пунктов`). Для этой задачи лучше всего подходят модели `Pro`.
+
+📈 **Контроль расходов (`/usage`)**
+Хотите узнать, сколько "ресурсов" я потратил? Отправьте команду `/usage`, чтобы посмотреть статистику использования токенов API за текущий день и месяц.
+
+Чтобы снова увидеть главное меню с кнопками, просто отправьте команду `/start` или `/menu`.
+"""
     if from_callback:
         keyboard = [[InlineKeyboardButton("⬅️ Назад в меню", callback_data='menu:main')]]
         await update.callback_query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -443,7 +462,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "clear":
             response_text = await clear_history_logic(update)
             await query.message.reply_text(response_text, parse_mode='Markdown')
-            await main_menu_command(update, context)
+            await menu_command(update, context)
         elif payload == "usage":
             await usage_command(update, context, from_callback=True)
         elif payload == "help":
@@ -569,7 +588,6 @@ def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Регистрация всех наших обработчиков
     application.add_handler(CommandHandler("start", main_menu_command))
     application.add_handler(CommandHandler("menu", main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
