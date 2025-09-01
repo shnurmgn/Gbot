@@ -180,7 +180,6 @@ def get_history(user_id: int) -> list:
     active_chat = get_active_chat_name(user_id)
     try:
         history_data = redis_client.get(f"history:{user_id}:{active_chat}")
-        # upstash-redis v1+ returns str, so we need to load it from json
         return json.loads(history_data) if history_data else []
     except Exception: return []
 
@@ -199,7 +198,6 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        # upstash-redis v1+ сам декодирует ответы, decode не нужен
         return stored_model if stored_model else default_model
     except Exception: return default_model
 
@@ -209,27 +207,68 @@ def get_user_persona(user_id: int) -> str:
 
 # --- Функции-обработчики ---
 
+async def get_main_menu_text_and_keyboard(user_id: int):
+    model_name = get_user_model(user_id)
+    active_chat = get_active_chat_name(user_id)
+    text = (
+        f"🤖 **Главное меню**\n\n"
+        f"Текущая модель: `{model_name}`\n"
+        f"Текущий чат: `{active_chat}`\n\n"
+        f"Выберите действие:"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("🤖 Выбрать модель", callback_data="menu:model"),
+            InlineKeyboardButton("👤 Персона", callback_data="menu:persona")
+        ],
+        [
+            InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
+        ],
+        [
+            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
+            InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
+        ],
+        [
+            InlineKeyboardButton("❓ Что умеет бот?", callback_data="menu:help")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+async def get_chats_submenu_text_and_keyboard():
+    text = "🗂️ **Управление чатами**"
+    keyboard = [
+        [InlineKeyboardButton("📖 Сохраненные чаты", callback_data="chats:list")],
+        [InlineKeyboardButton("📥 Сохранить текущий чат", callback_data="chats:save")],
+        [InlineKeyboardButton("➕ Новый чат", callback_data="chats:new")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает или обновляет главное инлайн-меню, удаляя старые клавиатуры."""
     user_id = update.effective_user.id
-    menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     
+    # Принудительно удаляем старую текстовую клавиатуру, если она была
     if update.message:
-        # Принудительно удаляем старую текстовую клавиатуру
         await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
         
+    menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     target_message = update.callback_query.message if update.callback_query else update.message
     
     try:
         await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
     except (AttributeError, telegram.error.BadRequest):
         if update.message:
-            try: await update.message.delete()
-            except: pass
+            try:
+                await update.message.delete()
+            except telegram.error.BadRequest:
+                pass 
         await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
+    """Логика очистки истории, для вызова из команды и кнопки."""
     user_id = update.effective_user.id
     active_chat = get_active_chat_name(user_id)
     if redis_client: redis_client.delete(f"history:{user_id}:{active_chat}")
@@ -563,7 +602,8 @@ def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
+    application.add_handler(CommandHandler("start", main_menu_command))
+    application.add_handler(CommandHandler("menu", main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("persona", persona_command))
