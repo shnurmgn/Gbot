@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,7 +22,7 @@ from PIL import Image
 import fitz
 from upstash_redis import Redis
 
-# --- Настройка (читает переменные окружения сервера) ---
+# --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
@@ -34,20 +34,18 @@ IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
 HISTORY_LIMIT = 10 
 DEFAULT_CHAT_NAME = "default"
 
-# --- Подключение к Upstash Redis (ОКОНЧАТЕЛЬНО ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
+# --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
-    # Важно: upstash-redis сам декодирует ответы, вручную это делать не нужно.
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
-    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -61,14 +59,12 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
-            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
 # --- Вспомогательные функции ---
-
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -94,7 +90,6 @@ async def send_long_message(update: Update, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
-    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -123,7 +118,6 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
-    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -142,20 +136,15 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                             last_update_time = current_time
                     except telegram.error.BadRequest:
                         pass
-        
         if placeholder_message:
             await placeholder_message.delete()
-        
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
              return
-
         await send_long_message(update, full_response_text)
-        
         update_history(update.effective_user.id, user_message_text, full_response_text)
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
-            
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
         if placeholder_message: await placeholder_message.delete()
@@ -205,15 +194,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Я бот, подключенный к Gemini.\n"
         f"Текущая модель: `{model_name}`\n"
-        f"Текущий чат: `{active_chat}`\n\n"
-        f"Используйте `/new_chat`, `/save_chat <имя>`, `/load_chat <имя>`, `/chats` для управления диалогами.",
+        f"Текущий чат: `{active_chat}`",
         parse_mode='Markdown'
     )
     await menu_command(update, context)
 
 @restricted
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает основное меню команд."""
     keyboard = [
         ["/model", "/persona"],
         ["/chats", "/new_chat", "/clear"],
@@ -224,7 +211,6 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def hide_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Скрывает основное меню команд."""
     await update.message.reply_text("Меню скрыто.", reply_markup=ReplyKeyboardRemove())
 
 @restricted
@@ -476,6 +462,9 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     supported_files_filter = filters.Document.PDF | filters.Document.DOCX | filters.Document.TXT
     application.add_handler(MessageHandler(supported_files_filter, handle_document_message))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("hide_menu", hide_menu_command))
+
     
     logger.info("Бот запущен и работает в режиме опроса...")
     application.run_polling()
