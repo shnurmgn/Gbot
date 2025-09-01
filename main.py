@@ -65,7 +65,6 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
-
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -192,7 +191,6 @@ def get_user_persona(user_id: int) -> str:
 # --- Функции-обработчики ---
 
 async def get_main_menu_text_and_keyboard(user_id: int):
-    """Собирает текст и клавиатуру для главного меню."""
     model_name = get_user_model(user_id)
     active_chat = get_active_chat_name(user_id)
     text = (
@@ -201,7 +199,6 @@ async def get_main_menu_text_and_keyboard(user_id: int):
         f"Текущий чат: `{active_chat}`\n\n"
         f"Выберите действие:"
     )
-    # --- ИЗМЕНЕНИЕ: Добавляем кнопку помощи ---
     keyboard = [
         [
             InlineKeyboardButton("🤖 Выбрать модель", callback_data="menu:model"),
@@ -211,7 +208,7 @@ async def get_main_menu_text_and_keyboard(user_id: int):
             InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
         ],
         [
-            InlineKeyboardButton("🗑️ Очистить чат", callback_data="menu:clear"),
+            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
             InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
         ],
         [
@@ -221,7 +218,6 @@ async def get_main_menu_text_and_keyboard(user_id: int):
     return text, InlineKeyboardMarkup(keyboard)
 
 async def get_chats_submenu_text_and_keyboard():
-    """Собирает текст и клавиатуру для ПОДМЕНЮ чатов."""
     text = "🗂️ **Управление чатами**"
     keyboard = [
         [InlineKeyboardButton("📖 Сохраненные чаты", callback_data="chats:list")],
@@ -230,40 +226,6 @@ async def get_chats_submenu_text_and_keyboard():
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
     ]
     return text, InlineKeyboardMarkup(keyboard)
-
-# --- НОВАЯ ФУНКЦИЯ ---
-@restricted
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback: bool = False):
-    """Отправляет сообщение со справкой о возможностях бота."""
-    help_text = (
-        "🤖 **Привет! Вот что я умею:**\n\n"
-        "Я ваш персональный ассистент на базе Google Gemini. Я могу общаться с вами, помнить контекст, генерировать и анализировать контент.\n\n"
-        "**Основные возможности:**\n\n"
-        "💬 **Диалог с памятью**\n"
-        "Просто общайтесь со мной. Я помню последние 10 сообщений, чтобы вы могли задавать уточняющие вопросы.\n\n"
-        "🖼️ **Работа с изображениями**\n"
-        "• **Генерация:** Выберите модель `Nano Banana` и попросите нарисовать что-нибудь (например, `нарисуй кота-астронавта`).\n"
-        "• **Анализ:** Отправьте мне фото с вопросом в подписи (например, `что на этой картинке?`).\n\n"
-        "📄 **Анализ документов**\n"
-        "Отправьте мне файл (`.pdf`, `.docx`, `.txt`) с задачей в подписи (например, `сделай краткую выжимку`). Для этого лучше всего подходят модели `Pro`.\n\n"
-        "**Команды управления:**\n"
-        "• `/menu` - Показать главное меню с кнопками.\n"
-        "• `/persona <текст>` - Установить мне личность. Пустая команда `/persona` сбрасывает ее.\n"
-        "• `/usage` - Посмотреть статистику использования токенов.\n"
-        "• `/clear` - Очистить историю текущего чата.\n\n"
-        "**Управление чатами:**\n"
-        "• `/new_chat` - Начать новый диалог.\n"
-        "• `/save_chat <имя>` - Сохранить текущий диалог.\n"
-        "• `/load_chat <имя>` - Загрузить сохраненный диалог.\n"
-        "• `/chats` - Показать список ваших диалогов.\n"
-        "• `/delete_chat <имя>` - Удалить диалог."
-    )
-    
-    if from_callback:
-        keyboard = [[InlineKeyboardButton("⬅️ Назад в меню", callback_data='menu:main')]]
-        await update.callback_query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    else:
-        await update.message.reply_text(help_text, parse_mode='Markdown')
 
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -274,8 +236,10 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
     except (AttributeError, telegram.error.BadRequest):
         if update.message:
-            try: await update.message.delete()
-            except: pass
+            try:
+                await update.message.delete()
+            except telegram.error.BadRequest:
+                pass
         await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
@@ -323,6 +287,37 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         redis_client.delete(f"persona:{user_id}")
         await update.message.reply_text("🗑️ Персона сброшена до стандартной.")
+        
+@restricted
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback: bool = False):
+    help_text = (
+        "🤖 **Привет! Вот что я умею:**\n\n"
+        "Я ваш персональный ассистент на базе Google Gemini. Я могу общаться с вами, помнить контекст, генерировать и анализировать контент.\n\n"
+        "**Основные возможности:**\n\n"
+        "💬 **Диалог с памятью**\n"
+        "Просто общайтесь со мной. Я помню последние 10 сообщений, чтобы вы могли задавать уточняющие вопросы.\n\n"
+        "🖼️ **Работа с изображениями**\n"
+        "• **Генерация:** Выберите модель `Nano Banana` и попросите нарисовать что-нибудь (например, `нарисуй кота-астронавта`).\n"
+        "• **Анализ:** Отправьте мне фото с вопросом в подписи (например, `что на этой картинке?`).\n\n"
+        "📄 **Анализ документов**\n"
+        "Отправьте мне файл (`.pdf`, `.docx`, `.txt`) с задачей в подписи (например, `сделай краткую выжимку`). Для этого лучше всего подходят модели `Pro`.\n\n"
+        "**Команды управления:**\n"
+        "• `/menu` - Показать главное меню с кнопками.\n"
+        "• `/persona <текст>` - Установить мне личность. Пустая команда `/persona` сбрасывает ее.\n"
+        "• `/usage` - Посмотреть статистику использования токенов.\n"
+        "• `/clear` - Очистить историю текущего чата.\n\n"
+        "**Управление чатами:**\n"
+        "• `/new_chat` - Начать новый диалог.\n"
+        "• `/save_chat <имя>` - Сохранить текущий диалог.\n"
+        "• `/load_chat <имя>` - Вернуться к сохраненному разговору.\n"
+        "• `/chats` - Показать список ваших диалогов.\n"
+        "• `/delete_chat <имя>` - Удалить диалог."
+    )
+    if from_callback:
+        keyboard = [[InlineKeyboardButton("⬅️ Назад в меню", callback_data='menu:main')]]
+        await update.callback_query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await update.message.reply_text(help_text, parse_mode='Markdown')
 
 @restricted
 async def model_selection_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -441,15 +436,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(submenu_text, reply_markup=reply_markup, parse_mode='Markdown')
         elif payload == "clear":
             response_text = await clear_history_logic(update)
-            # Отправляем подтверждение как новое сообщение, чтобы оно не исчезло
             await query.message.reply_text(response_text, parse_mode='Markdown')
-            await menu_command(update, context)
+            await main_menu_command(update, context)
         elif payload == "usage":
             await usage_command(update, context, from_callback=True)
         elif payload == "help":
             await help_command(update, context, from_callback=True)
         elif payload == "main":
-            await menu_command(update, context)
+            await main_menu_command(update, context)
 
     elif command == "chats":
         if payload == "list":
@@ -458,7 +452,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Чтобы сохранить текущий чат, отправьте команду:\n`/save_chat <имя_чата>`\nПробелы будут заменены на `_`.", parse_mode='Markdown')
         elif payload == "new":
             await new_chat_command(update, context, from_callback=True)
-            await menu_command(update, context)
+            await main_menu_command(update, context)
             
     elif command == "select_model":
         user_id = query.from_user.id
@@ -474,23 +468,103 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    user_message = update.message.text
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+    try:
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
+        if model_name in IMAGE_GEN_MODELS:
+            image_prompt = f"Generate a high-quality, photorealistic image of: {user_message}"
+            response = await model.generate_content_async(image_prompt)
+            await handle_gemini_response(update, response)
+            update_history(user_id, user_message, "[Запрос на генерацию изображения]")
+        else:
+            history = get_history(user_id)
+            chat = model.start_chat(history=history)
+            response_stream = await chat.send_message_async(user_message, stream=True)
+            await handle_gemini_response_stream(update, response_stream, user_message)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке текстового сообщения: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in IMAGE_GEN_MODELS:
+        await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /menu.")
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    caption = update.message.caption or "Опиши это изображение"
+    await update.message.reply_chat_action(telegram.constants.ChatAction.UPLOAD_PHOTO)
+    try:
+        photo_bytes = io.BytesIO()
+        await photo_file.download_to_memory(photo_bytes)
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        model_gemini = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model_gemini.generate_content_async([caption, img])
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке фото: {e}')
 
 @restricted
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in DOCUMENT_ANALYSIS_MODELS:
+        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
+        return
+    doc = update.message.document
+    caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
+    await update.message.reply_text(f"Получил файл: {doc.file_name}.\nНачинаю обработку...")
+    try:
+        doc_file = await doc.get_file()
+        file_bytes_io = io.BytesIO()
+        await doc_file.download_to_memory(file_bytes_io)
+        file_bytes_io.seek(0)
+        content_parts = [caption]
+        if doc.mime_type == 'application/pdf':
+            pdf_document = fitz.open(stream=file_bytes_io.read(), filetype="pdf")
+            page_limit = 25 
+            num_pages = min(len(pdf_document), page_limit)
+            for page_num in range(num_pages):
+                page = pdf_document.load_page(page_num)
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_bytes))
+                content_parts.append(img)
+            pdf_document.close()
+            await update.message.reply_text(f"Отправляю первые {num_pages} страниц PDF в Gemini на анализ...")
+        elif doc.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            document = docx.Document(file_bytes_io)
+            file_text_content = "\n".join([para.text for para in document.paragraphs])
+            content_parts.append(file_text_content)
+        elif doc.mime_type == 'text/plain':
+            file_text_content = file_bytes_io.read().decode('utf-8')
+            content_parts.append(file_text_content)
+        else:
+            await update.message.reply_text(f"Извините, я пока не поддерживаю файлы типа {doc.mime_type}.")
+            return
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model.generate_content_async(content_parts)
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке документа: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
 
-# --- Точка входа для сервера ---
+# --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
-    application.add_handler(CommandHandler("help", help_command)) # <-- НОВАЯ КОМАНДА
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("menu", main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("persona", persona_command))
@@ -499,6 +573,7 @@ def main() -> None:
     application.add_handler(CommandHandler("load_chat", load_chat_command))
     application.add_handler(CommandHandler("chats", list_chats_command))
     application.add_handler(CommandHandler("delete_chat", delete_chat_command))
+    application.add_handler(CommandHandler("help", help_command))
     
     application.add_handler(CallbackQueryHandler(button_callback))
     
