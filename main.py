@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,12 +31,13 @@ ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.spl
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
-HISTORY_LIMIT = 10 
+HISTORY_LIMIT = 10
 DEFAULT_CHAT_NAME = "default"
 
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
+    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN')
@@ -59,13 +60,14 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
-            elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
 # --- Вспомогательные функции ---
+
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -82,6 +84,7 @@ def update_usage_stats(user_id: int, usage_metadata):
         logger.error(f"Ошибка обновления статистики использования: {e}")
 
 async def send_long_message(message: telegram.Message, text: str):
+    """Надежно отправляет длинные сообщения, пытаясь сначала с Markdown, потом как простой текст."""
     if not text.strip(): return
     chunks = []
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -104,6 +107,7 @@ async def send_long_message(message: telegram.Message, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -132,6 +136,7 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
+    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -139,6 +144,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
+        
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
@@ -153,6 +159,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
         
         await placeholder_message.delete()
         
+        # Проверяем, не пустой ли ответ ПОСЛЕ завершения стрима
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
              return
@@ -203,43 +210,6 @@ def get_user_persona(user_id: int) -> str:
     return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
-
-async def get_main_menu_text_and_keyboard(user_id: int):
-    model_name = get_user_model(user_id)
-    active_chat = get_active_chat_name(user_id)
-    text = (
-        f"🤖 **Главное меню**\n\n"
-        f"Текущая модель: `{model_name}`\n"
-        f"Текущий чат: `{active_chat}`\n\n"
-        f"Выберите действие:"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton("🤖 Выбрать модель", callback_data="menu:model"),
-            InlineKeyboardButton("👤 Персона", callback_data="menu:persona")
-        ],
-        [
-            InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
-        ],
-        [
-            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
-            InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
-        ],
-        [
-            InlineKeyboardButton("❓ Что умеет бот?", callback_data="menu:help")
-        ]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
-
-async def get_chats_submenu_text_and_keyboard():
-    text = "🗂️ **Управление чатами**"
-    keyboard = [
-        [InlineKeyboardButton("📖 Сохраненные чаты", callback_data="chats:list")],
-        [InlineKeyboardButton("📥 Сохранить текущий чат", callback_data="chats:save")],
-        [InlineKeyboardButton("➕ Новый чат", callback_data="chats:new")],
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
 
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -469,7 +439,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "clear":
             response_text = await clear_history_logic(update)
             await query.message.reply_text(response_text, parse_mode='Markdown')
-            await menu_command(update, context)
+            await main_menu_command(update, context)
         elif payload == "usage":
             await usage_command(update, context, from_callback=True)
         elif payload == "help":
