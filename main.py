@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,6 +40,7 @@ try:
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -65,6 +66,7 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
+
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -225,37 +227,18 @@ async def get_chats_submenu_text_and_keyboard():
     return text, InlineKeyboardMarkup(keyboard)
 
 @restricted
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает /start и принудительно убирает старую клавиатуру."""
-    user = update.effective_user
-    
-    # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
-    # Сначала отправляем сообщение с командой на удаление старой клавиатуры
-    await update.message.reply_text("Загрузка...", reply_markup=ReplyKeyboardRemove())
-    
-    # Теперь показываем новое инлайн-меню
-    await update.message.reply_html(rf"Привет, {user.mention_html()}!")
-    menu_text, reply_markup = await get_main_menu_text_and_keyboard(user.id)
-    await update.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-@restricted
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает или обновляет главное инлайн-меню."""
     user_id = update.effective_user.id
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     
-    # Определяем, откуда пришел вызов - от команды или от кнопки "Назад"
-    target_message = update.callback_query.message if update.callback_query else update.message
+    # Принудительно удаляем старую клавиатуру, если она есть
+    await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
+    # Удаляем это техническое сообщение
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
 
-    # Пытаемся отредактировать. Если не получается (например, это новое сообщение) - отправляем.
-    try:
-        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except (AttributeError, telegram.error.BadRequest):
-        # Если редактирование не удалось, отправляем новое сообщение и удаляем старое (если это был текстовый вызов /menu)
-        if update.message:
-            await update.message.delete()
-        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-
+    # Отправляем новое инлайн-меню
+    await update.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     """Логика очистки истории, для вызова из команды и кнопки."""
@@ -422,7 +405,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "clear":
             response_text = await clear_history_logic(update)
             await query.message.reply_text(response_text, parse_mode='Markdown')
-            await menu_command(update, context)
+            # Обновляем главное меню, чтобы показать, что чат пуст (если это как-то отображается)
+            user_id = update.effective_user.id
+            menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
+            await query.message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
         elif payload == "usage":
             await usage_command(update, context, from_callback=True)
         elif payload == "main":
