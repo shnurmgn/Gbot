@@ -230,8 +230,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     # Принудительно удаляем старую клавиатуру, отправив сообщение с ReplyKeyboardRemove
     await update.message.reply_text("Загрузка...", reply_markup=ReplyKeyboardRemove())
+    # Удаляем это техническое сообщение
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
     
-    # Теперь показываем новое инлайн-меню
+    # Показываем приветствие и новое инлайн-меню
     await update.message.reply_html(rf"Привет, {user.mention_html()}!")
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user.id)
     await update.message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -249,7 +251,10 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
     except (AttributeError, telegram.error.BadRequest):
         if update.message:
-            await update.message.delete()
+            try:
+                await update.message.delete()
+            except telegram.error.BadRequest:
+                pass 
         await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
@@ -416,9 +421,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(submenu_text, reply_markup=reply_markup, parse_mode='Markdown')
         elif payload == "clear":
             response_text = await clear_history_logic(update)
-            # Отправляем подтверждение как новое сообщение, чтобы оно не исчезло
             await query.message.reply_text(response_text, parse_mode='Markdown')
-            # Обновляем главное меню
             await menu_command(update, context)
         elif payload == "usage":
             await usage_command(update, context, from_callback=True)
@@ -498,7 +501,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     model_name = get_user_model(user_id)
     persona = get_user_persona(user_id)
     if model_name not in DOCUMENT_ANALYSIS_MODELS:
-        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro через /menu.")
+        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
         return
     doc = update.message.document
     caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
@@ -544,7 +547,7 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("menu", main_menu_command))
+    application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("persona", persona_command))
