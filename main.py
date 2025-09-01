@@ -17,6 +17,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    Defaults,
 )
 from PIL import Image
 import fitz
@@ -210,6 +211,43 @@ def get_user_persona(user_id: int) -> str:
     return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
+
+async def get_main_menu_text_and_keyboard(user_id: int):
+    model_name = get_user_model(user_id)
+    active_chat = get_active_chat_name(user_id)
+    text = (
+        f"🤖 **Главное меню**\n\n"
+        f"Текущая модель: `{model_name}`\n"
+        f"Текущий чат: `{active_chat}`\n\n"
+        f"Выберите действие:"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("🤖 Выбрать модель", callback_data="menu:model"),
+            InlineKeyboardButton("👤 Персона", callback_data="menu:persona")
+        ],
+        [
+            InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
+        ],
+        [
+            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
+            InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
+        ],
+        [
+            InlineKeyboardButton("❓ Что умеет бот?", callback_data="menu:help")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+async def get_chats_submenu_text_and_keyboard():
+    text = "🗂️ **Управление чатами**"
+    keyboard = [
+        [InlineKeyboardButton("📖 Сохраненные чаты", callback_data="chats:list")],
+        [InlineKeyboardButton("📥 Сохранить текущий чат", callback_data="chats:save")],
+        [InlineKeyboardButton("➕ Новый чат", callback_data="chats:new")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
 
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -563,7 +601,6 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     
-    # Увеличиваем таймауты для http-запросов
     defaults = Defaults(
         connect_timeout=10,
         read_timeout=30,
