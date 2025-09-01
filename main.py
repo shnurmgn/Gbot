@@ -22,7 +22,7 @@ from PIL import Image
 import fitz
 from upstash_redis import Redis
 
-# --- Настройка ---
+# --- Настройка (читает переменные окружения сервера) ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
@@ -34,18 +34,19 @@ IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
 HISTORY_LIMIT = 10 
 DEFAULT_CHAT_NAME = "default"
 
-# --- Подключение к Upstash Redis ---
+# --- Подключение к Upstash Redis (ОКОНЧАТЕЛЬНО ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
 redis_client = None
 try:
+    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -91,6 +92,7 @@ async def send_long_message(update: Update, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -105,18 +107,21 @@ async def handle_gemini_response(update: Update, response):
             await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
             return
         full_text = ""
+        image_sent = False
         for part in candidate.content.parts:
             if hasattr(part, 'text') and part.text:
                 full_text += part.text
             elif hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
                 await update.message.reply_photo(photo=io.BytesIO(part.inline_data.data))
-        if full_text:
+                image_sent = True
+        if full_text and not image_sent:
             await send_long_message(update, full_text)
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
+    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -136,15 +141,16 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                     except telegram.error.BadRequest:
                         pass
         
-        await placeholder_message.delete()
+        if placeholder_message:
+            await placeholder_message.delete()
         
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
              return
 
         await send_long_message(update, full_response_text)
-        update_history(update.effective_user.id, user_message_text, full_response_text)
         
+        update_history(update.effective_user.id, user_message_text, full_response_text)
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
             
@@ -273,39 +279,31 @@ async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not redis_client: return
-    
-    chat_name = " ".join(context.args).strip().replace(" ", "_") # Заменяем пробелы на подчеркивания
+    chat_name = " ".join(context.args).strip().replace(" ", "_")
     if not chat_name or chat_name == DEFAULT_CHAT_NAME:
         await update.message.reply_text("Пожалуйста, укажите имя для сохранения. Например: `/save_chat мой_проект`.")
         return
-
     active_chat = get_active_chat_name(user_id)
     current_history_json = redis_client.get(f"history:{user_id}:{active_chat}")
-
     if not current_history_json:
         await update.message.reply_text("Текущий диалог пуст, нечего сохранять.")
         return
-
     redis_client.set(f"history:{user_id}:{chat_name}", current_history_json, ex=86400 * 7)
     redis_client.sadd(f"chats:{user_id}", chat_name)
     redis_client.set(f"active_chat:{user_id}", chat_name)
-    
     await update.message.reply_text(f"Текущий диалог сохранен как `{chat_name}` и сделан активным.")
 
 @restricted
 async def load_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not redis_client: return
-    
     chat_name = " ".join(context.args).strip()
     if not chat_name:
         await update.message.reply_text("Пожалуйста, укажите имя чата для загрузки. Например: `/load_chat мой_проект`.")
         return
-        
     if not redis_client.sismember(f"chats:{user_id}", chat_name) and chat_name != DEFAULT_CHAT_NAME:
         await update.message.reply_text(f"Чата с именем `{chat_name}` не найдено.")
         return
-    
     redis_client.set(f"active_chat:{user_id}", chat_name)
     await update.message.reply_text(f"Чат `{chat_name}` загружен и сделан активным.")
 
@@ -313,41 +311,33 @@ async def load_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not redis_client: return
-
     active_chat = get_active_chat_name(user_id)
     all_chats = redis_client.smembers(f"chats:{user_id}")
-    
     message = f"**Ваши диалоги:**\n\n"
     if active_chat == DEFAULT_CHAT_NAME:
         message += f"➡️ `{DEFAULT_CHAT_NAME}` (активный)\n"
     else:
         message += f"▫️ `{DEFAULT_CHAT_NAME}`\n"
-    
     for chat in sorted(list(all_chats)):
         if chat == active_chat:
             message += f"➡️ `{chat}` (активный)\n"
         else:
             message += f"▫️ `{chat}`\n"
-
     await update.message.reply_text(message, parse_mode='Markdown')
 
 @restricted
 async def delete_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not redis_client: return
-    
     chat_name = " ".join(context.args).strip()
     if not chat_name or chat_name == DEFAULT_CHAT_NAME:
         await update.message.reply_text(f"Нельзя удалить чат по умолчанию. Укажите имя, например: `/delete_chat мой_проект`.")
         return
-        
     if not redis_client.sismember(f"chats:{user_id}", chat_name):
         await update.message.reply_text(f"Чата с именем `{chat_name}` не найдено.")
         return
-    
     redis_client.delete(f"history:{user_id}:{chat_name}")
     redis_client.srem(f"chats:{user_id}", chat_name)
-    
     active_chat = get_active_chat_name(user_id)
     if active_chat == chat_name:
         redis_client.set(f"active_chat:{user_id}", DEFAULT_CHAT_NAME)
@@ -364,7 +354,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
         model = genai.GenerativeModel(model_name, system_instruction=persona)
-        
         if model_name in IMAGE_GEN_MODELS:
             image_prompt = f"Generate a high-quality, photorealistic image of: {user_message}"
             response = await model.generate_content_async(image_prompt)
@@ -453,7 +442,6 @@ def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Регистрация всех наших обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("model", model_selection))
