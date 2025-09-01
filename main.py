@@ -65,6 +65,7 @@ def restricted(func):
     return wrapped
 
 # --- Вспомогательные функции ---
+
 def update_usage_stats(user_id: int, usage_metadata):
     if not redis_client or not hasattr(usage_metadata, 'total_token_count'): return
     try:
@@ -136,15 +137,19 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                             last_update_time = current_time
                     except telegram.error.BadRequest:
                         pass
-        if placeholder_message:
-            await placeholder_message.delete()
+        
+        await placeholder_message.delete()
+        
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
              return
+
         await send_long_message(update.message, full_response_text)
         update_history(update.effective_user.id, user_message_text, full_response_text)
+        
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
+            
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
         if placeholder_message: await placeholder_message.delete()
@@ -210,7 +215,7 @@ async def get_main_menu_text_and_keyboard(user_id: int):
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
-async def get_chats_submenu_text_and_keyboard(user_id: int):
+async def get_chats_submenu_text_and_keyboard():
     text = "🗂️ **Управление чатами**"
     keyboard = [
         [InlineKeyboardButton("📖 Сохраненные чаты", callback_data="chats:list")],
@@ -237,7 +242,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (AttributeError, telegram.error.BadRequest):
         await target_message.reply_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
-async def clear_history_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
     active_chat = get_active_chat_name(user_id)
     if redis_client: redis_client.delete(f"history:{user_id}:{active_chat}")
@@ -245,7 +250,7 @@ async def clear_history_logic(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @restricted
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    response_text = await clear_history_logic(update, context)
+    response_text = await clear_history_logic(update)
     await update.message.reply_text(response_text, parse_mode='Markdown')
 
 @restricted
@@ -303,10 +308,8 @@ async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     redis_client.set(f"active_chat:{user_id}", DEFAULT_CHAT_NAME)
     redis_client.delete(f"history:{user_id}:{DEFAULT_CHAT_NAME}")
     response_text = f"Начат новый диалог (`{DEFAULT_CHAT_NAME}`)."
-    if from_callback:
-        await update.callback_query.message.reply_text(response_text, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(response_text, parse_mode='Markdown')
+    target_message = update.callback_query.message if from_callback else update.message
+    await target_message.reply_text(response_text, parse_mode='Markdown')
 
 @restricted
 async def save_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,7 +317,7 @@ async def save_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not redis_client: return
     chat_name = "_".join(context.args).strip()
     if not chat_name or chat_name == DEFAULT_CHAT_NAME:
-        await update.message.reply_text("Пожалуйста, укажите имя для сохранения. Например: `/save_chat мой_проект`.")
+        await update.message.reply_text("Пожалуйста, укажите имя для сохранения. Например: `/save_chat мой проект`.")
         return
     active_chat = get_active_chat_name(user_id)
     current_history_json = redis_client.get(f"history:{user_id}:{active_chat}")
@@ -398,10 +401,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "persona":
             await query.message.reply_text("Отправьте команду:\n`/persona <текст>` для установки,\n`/persona` без текста для сброса.", parse_mode='Markdown')
         elif payload == "open_chats_submenu":
-            submenu_text, reply_markup = await get_chats_submenu_text_and_keyboard(query.from_user.id)
+            submenu_text, reply_markup = await get_chats_submenu_text_and_keyboard()
             await query.edit_message_text(submenu_text, reply_markup=reply_markup, parse_mode='Markdown')
         elif payload == "clear":
-            response_text = await clear_history_logic(update, context)
+            response_text = await clear_history_logic(update)
             await query.message.reply_text(response_text, parse_mode='Markdown')
             await menu_command(update, context)
         elif payload == "usage":
@@ -413,7 +416,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if payload == "list":
             await list_chats_command(update, context, from_callback=True)
         elif payload == "save":
-            await query.message.reply_text("Чтобы сохранить текущий чат, отправьте команду:\n`/save_chat <имя_чата>`\nИмена с пробелами будут соединены `_`.", parse_mode='Markdown')
+            await query.message.reply_text("Чтобы сохранить текущий чат, отправьте команду:\n`/save_chat <имя_чата>`\nПробелы будут заменены на `_`.", parse_mode='Markdown')
         elif payload == "new":
             await new_chat_command(update, context, from_callback=True)
             await menu_command(update, context)
@@ -455,13 +458,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in IMAGE_GEN_MODELS:
+        await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /model.")
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    caption = update.message.caption or "Опиши это изображение"
+    await update.message.reply_chat_action(telegram.constants.ChatAction.UPLOAD_PHOTO)
+    try:
+        photo_bytes = io.BytesIO()
+        await photo_file.download_to_memory(photo_bytes)
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        model_gemini = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model_gemini.generate_content_async([caption, img])
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке фото: {e}')
 
 @restricted
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in DOCUMENT_ANALYSIS_MODELS:
+        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
+        return
+    doc = update.message.document
+    caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
+    await update.message.reply_text(f"Получил файл: {doc.file_name}.\nНачинаю обработку...")
+    try:
+        doc_file = await doc.get_file()
+        file_bytes_io = io.BytesIO()
+        await doc_file.download_to_memory(file_bytes_io)
+        file_bytes_io.seek(0)
+        content_parts = [caption]
+        if doc.mime_type == 'application/pdf':
+            pdf_document = fitz.open(stream=file_bytes_io.read(), filetype="pdf")
+            page_limit = 25 
+            num_pages = min(len(pdf_document), page_limit)
+            for page_num in range(num_pages):
+                page = pdf_document.load_page(page_num)
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_bytes))
+                content_parts.append(img)
+            pdf_document.close()
+            await update.message.reply_text(f"Отправляю первые {num_pages} страниц PDF в Gemini на анализ...")
+        elif doc.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            document = docx.Document(file_bytes_io)
+            file_text_content = "\n".join([para.text for para in document.paragraphs])
+            content_parts.append(file_text_content)
+        elif doc.mime_type == 'text/plain':
+            file_text_content = file_bytes_io.read().decode('utf-8')
+            content_parts.append(file_text_content)
+        else:
+            await update.message.reply_text(f"Извините, я пока не поддерживаю файлы типа {doc.mime_type}.")
+            return
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model.generate_content_async(content_parts)
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке документа: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
 
-# --- Точка входа для сервера ---
+# --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
