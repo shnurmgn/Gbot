@@ -17,7 +17,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    ExtBot,
+    Defaults,
 )
+from telegram.request import HTTPXRequest
 from PIL import Image
 import fitz
 from upstash_redis import Redis
@@ -168,7 +171,11 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
             
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        if placeholder_message: await placeholder_message.delete()
+        if placeholder_message: 
+            try:
+                await placeholder_message.delete()
+            except:
+                pass
         await update.message.reply_text(f"Произошла ошибка при генерации ответа: {e}")
 
 def get_active_chat_name(user_id: int) -> str:
@@ -246,29 +253,24 @@ async def get_chats_submenu_text_and_keyboard():
 
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает или обновляет главное инлайн-меню, удаляя старые клавиатуры."""
     user_id = update.effective_user.id
-    
-    # Принудительно удаляем старую текстовую клавиатуру, если она была
-    if update.message:
-        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
-        
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else update.message
+    
+    if update.message:
+        await update.message.delete()
+        
+    target_message = update.callback_query.message if update.callback_query else None
     
     try:
-        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except (AttributeError, telegram.error.BadRequest):
-        if update.message:
-            try:
-                await update.message.delete()
-            except telegram.error.BadRequest:
-                pass 
-        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        if target_message:
+            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" not in str(e):
+             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
-    """Логика очистки истории, для вызова из команды и кнопки."""
     user_id = update.effective_user.id
     active_chat = get_active_chat_name(user_id)
     if redis_client: redis_client.delete(f"history:{user_id}:{active_chat}")
