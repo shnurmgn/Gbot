@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,6 +40,7 @@ try:
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -231,7 +232,13 @@ async def get_chats_submenu_text_and_keyboard():
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
+    
+    # Принудительно удаляем старую текстовую клавиатуру, если она есть
+    await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
+    
     target_message = update.callback_query.message if update.callback_query else update.message
+    
     try:
         await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
     except (AttributeError, telegram.error.BadRequest):
@@ -239,7 +246,7 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await update.message.delete()
             except telegram.error.BadRequest:
-                pass
+                pass 
         await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
@@ -437,13 +444,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "clear":
             response_text = await clear_history_logic(update)
             await query.message.reply_text(response_text, parse_mode='Markdown')
-            await main_menu_command(update, context)
+            await menu_command(update, context)
         elif payload == "usage":
             await usage_command(update, context, from_callback=True)
         elif payload == "help":
             await help_command(update, context, from_callback=True)
         elif payload == "main":
-            await main_menu_command(update, context)
+            await menu_command(update, context)
 
     elif command == "chats":
         if payload == "list":
@@ -452,7 +459,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Чтобы сохранить текущий чат, отправьте команду:\n`/save_chat <имя_чата>`\nПробелы будут заменены на `_`.", parse_mode='Markdown')
         elif payload == "new":
             await new_chat_command(update, context, from_callback=True)
-            await main_menu_command(update, context)
+            await menu_command(update, context)
             
     elif command == "select_model":
         user_id = query.from_user.id
