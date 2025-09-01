@@ -17,10 +17,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    ExtBot,
-    Defaults,
 )
-from telegram.request import HTTPXRequest
 from PIL import Image
 import fitz
 from upstash_redis import Redis
@@ -96,7 +93,7 @@ async def send_long_message(message: telegram.Message, text: str):
         try:
             await message.reply_text(chunk, parse_mode='Markdown')
         except telegram.error.BadRequest as e:
-            if "can't parse entities" in str(e):
+            if "can't parse entities" in str(e).lower():
                 logger.warning(f"Ошибка разметки Markdown. Повторная отправка как простой текст.")
                 await message.reply_text(chunk)
             else:
@@ -213,43 +210,6 @@ def get_user_persona(user_id: int) -> str:
     return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
-
-async def get_main_menu_text_and_keyboard(user_id: int):
-    model_name = get_user_model(user_id)
-    active_chat = get_active_chat_name(user_id)
-    text = (
-        f"🤖 **Главное меню**\n\n"
-        f"Текущая модель: `{model_name}`\n"
-        f"Текущий чат: `{active_chat}`\n\n"
-        f"Выберите действие:"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton("🤖 Выбрать модель", callback_data="menu:model"),
-            InlineKeyboardButton("👤 Персона", callback_data="menu:persona")
-        ],
-        [
-            InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
-        ],
-        [
-            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
-            InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
-        ],
-        [
-            InlineKeyboardButton("❓ Что умеет бот?", callback_data="menu:help")
-        ]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
-
-async def get_chats_submenu_text_and_keyboard():
-    text = "🗂️ **Управление чатами**"
-    keyboard = [
-        [InlineKeyboardButton("📖 Сохраненные чаты", callback_data="chats:list")],
-        [InlineKeyboardButton("📥 Сохранить текущий чат", callback_data="chats:save")],
-        [InlineKeyboardButton("➕ Новый чат", callback_data="chats:new")],
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
 
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,10 +562,16 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 # --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    application.add_handler(CommandHandler("start", main_menu_command))
-    application.add_handler(CommandHandler("menu", main_menu_command))
+    # Увеличиваем таймауты для http-запросов
+    defaults = Defaults(
+        connect_timeout=10,
+        read_timeout=30,
+        write_timeout=30
+    )
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).defaults(defaults).build()
+    
+    application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("persona", persona_command))
