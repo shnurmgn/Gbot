@@ -62,7 +62,6 @@ def restricted(func):
         if user_id not in ALLOWED_USER_IDS:
             logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
-            elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
@@ -140,21 +139,22 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
+        
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
                 current_time = time.time()
                 if current_time - last_update_time > update_interval:
                     try:
-                        if len(full_response_text) < TELEGRAM_MAX_MESSAGE_LENGTH - 10:
-                            # Редактируем без Markdown, чтобы избежать ошибок
-                            await placeholder_message.edit_text(full_response_text + " ✍️")
-                            last_update_time = current_time
+                        # ВАЖНО: Редактируем без Markdown, чтобы избежать ошибок
+                        await placeholder_message.edit_text(full_response_text + " ✍️")
+                        last_update_time = current_time
                     except telegram.error.BadRequest:
                         pass
         
         await placeholder_message.delete()
         
+        # Проверяем, не пустой ли ответ ПОСЛЕ завершения стрима
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
              return
@@ -207,56 +207,14 @@ def get_user_persona(user_id: int) -> str:
 
 # --- Функции-обработчики ---
 
-async def get_main_menu_text_and_keyboard(user_id: int):
-    model_name = get_user_model(user_id)
-    active_chat = get_active_chat_name(user_id)
-    text = (
-        f"🤖 **Главное меню**\n\n"
-        f"Текущая модель: `{model_name}`\n"
-        f"Текущий чат: `{active_chat}`\n\n"
-        f"Выберите действие:"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton("🤖 Выбрать модель", callback_data="menu:model"),
-            InlineKeyboardButton("👤 Персона", callback_data="menu:persona")
-        ],
-        [
-            InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
-        ],
-        [
-            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
-            InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
-        ],
-        [
-            InlineKeyboardButton("❓ Что умеет бот?", callback_data="menu:help")
-        ]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
-
-async def get_chats_submenu_text_and_keyboard():
-    text = "🗂️ **Управление чатами**"
-    keyboard = [
-        [InlineKeyboardButton("📖 Сохраненные чаты", callback_data="chats:list")],
-        [InlineKeyboardButton("📥 Сохранить текущий чат", callback_data="chats:save")],
-        [InlineKeyboardButton("➕ Новый чат", callback_data="chats:new")],
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
-
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает или обновляет главное инлайн-меню, удаляя старые клавиатуры."""
     user_id = update.effective_user.id
-    
-    # Сначала отправляем сообщение с командой на удаление старой клавиатуры, если она была
-    if update.message:
-        await update.message.reply_text("Загрузка меню...", reply_markup=ReplyKeyboardRemove())
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
-        if update.message.text.strip() in ["/start", "/menu"]:
-            await update.message.delete()
-    
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
+    
+    if update.message:
+        await update.message.delete()
+        
     target_message = update.callback_query.message if update.callback_query else None
     
     try:
