@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,18 +34,20 @@ IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
 HISTORY_LIMIT = 10 
 DEFAULT_CHAT_NAME = "default"
 
-# --- Подключение к Upstash Redis ---
+# --- Подключение к Upstash Redis (ОКОНЧАТЕЛЬНО ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
 redis_client = None
 try:
+    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
+    # Важно: upstash-redis сам декодирует ответы, вручную это делать не нужно.
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -204,10 +206,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Я бот, подключенный к Gemini.\n"
         f"Текущая модель: `{model_name}`\n"
         f"Текущий чат: `{active_chat}`\n\n"
-        f"Чтобы показать меню команд, отправьте /menu.",
+        f"Используйте `/new_chat`, `/save_chat <имя>`, `/load_chat <имя>`, `/chats` для управления диалогами.",
         parse_mode='Markdown'
     )
-    await menu_command(update, context) # Сразу покажем меню при старте
+    await menu_command(update, context)
 
 @restricted
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
