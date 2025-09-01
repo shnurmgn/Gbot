@@ -601,11 +601,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     
-    defaults = Defaults(
-        connect_timeout=10,
-        read_timeout=30,
-        write_timeout=30
-    )
+    defaults = Defaults(connect_timeout=10, read_timeout=30)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).defaults(defaults).build()
     
     application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
