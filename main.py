@@ -9,7 +9,7 @@ import docx
 import google.generativeai as genai
 from datetime import datetime
 import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,19 +34,18 @@ IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
 HISTORY_LIMIT = 10 
 DEFAULT_CHAT_NAME = "default"
 
-# --- Подключение к Upstash Redis (ОКОНЧАТЕЛЬНО ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
+# --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # УДАЛЕН НЕПОДДЕРЖИВАЕМЫЙ ПАРАМЕТР 'decode_responses'
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
-    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -60,6 +59,7 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             return
         return await func(update, context, *args, **kwargs)
@@ -204,9 +204,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Я бот, подключенный к Gemini.\n"
         f"Текущая модель: `{model_name}`\n"
         f"Текущий чат: `{active_chat}`\n\n"
-        f"Используйте `/new_chat`, `/save_chat <имя>`, `/load_chat <имя>`, `/chats` для управления диалогами.",
+        f"Чтобы показать меню команд, отправьте /menu.",
         parse_mode='Markdown'
     )
+    await menu_command(update, context) # Сразу покажем меню при старте
+
+@restricted
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает основное меню команд."""
+    keyboard = [
+        ["/model", "/persona"],
+        ["/chats", "/new_chat", "/clear"],
+        ["/usage", "/hide_menu"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("📋 Главное меню:", reply_markup=reply_markup)
+
+@restricted
+async def hide_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрывает основное меню команд."""
+    await update.message.reply_text("Меню скрыто.", reply_markup=ReplyKeyboardRemove())
 
 @restricted
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,11 +266,11 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("Gemini 2.5 Pro (Документы/Текст)", callback_data='gemini-2.5-pro')],
-        [InlineKeyboardButton("Gemini 1.5 Pro (Документы/Текст)", callback_data='gemini-1.5-pro')],
-        [InlineKeyboardButton("Gemini 2.5 Flash (Текст)", callback_data='gemini-2.5-flash')],
-        [InlineKeyboardButton("Gemini 1.5 Flash (Текст)", callback_data='gemini-1.5-flash')],
-        [InlineKeyboardButton("Nano Banana (Изображения)", callback_data='gemini-2.5-flash-image-preview')],
+        [InlineKeyboardButton("Gemini 2.5 Pro", callback_data='gemini-2.5-pro')],
+        [InlineKeyboardButton("Gemini 1.5 Pro", callback_data='gemini-1.5-pro')],
+        [InlineKeyboardButton("Gemini 2.5 Flash", callback_data='gemini-2.5-flash')],
+        [InlineKeyboardButton("Gemini 1.5 Flash", callback_data='gemini-1.5-flash')],
+        [InlineKeyboardButton("Nano Banana (Image)", callback_data='gemini-2.5-flash-image-preview')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Выберите модель:', reply_markup=reply_markup)
