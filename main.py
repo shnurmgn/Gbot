@@ -44,7 +44,6 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN'),
@@ -68,6 +67,7 @@ def restricted(func):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
+            elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
@@ -299,6 +299,9 @@ async def get_main_menu_text_and_keyboard(user_id: int):
         ],
         [
             InlineKeyboardButton("🔍 Поиск в интернете", callback_data="menu:search"),
+            InlineKeyboardButton("💻 Интерпретатор кода", callback_data="menu:code")
+        ],
+        [
             InlineKeyboardButton("❓ Помощь", callback_data="menu:help")
         ]
     ]
@@ -317,16 +320,12 @@ async def get_chats_submenu_text_and_keyboard():
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
     if update.message:
-        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
-        
+        await update.message.delete()
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else update.message
-    
+    target_message = update.callback_query.message if update.callback_query else None
     try:
-        if target_message and not update.message:
+        if target_message:
             await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
         else:
             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -384,6 +383,10 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback: bool = False):
     help_text = """
 Я ваш персональный ассистент, подключенный к мощным нейросетям Google Gemini.
+
+💻 **Интерпретатор кода (`/code`)**
+Для выполнения кода и анализа данных.
+Пример: `/code нарисуй график синусоиды и сохрани в plot.png`
 
 🔍 **Поиск в интернете (`/search`)**
 Для вопросов о текущих событиях. 
@@ -542,8 +545,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await help_command(update, context, from_callback=True)
         elif payload == "search":
             await query.message.reply_text("Чтобы использовать поиск, отправьте команду:\n`/search <ваш запрос>`", parse_mode='Markdown')
-        elif payload == "deep_search":
-            await query.message.reply_text("Чтобы использовать глубокий поиск, отправьте команду:\n`/deep_search <ваш сложный вопрос>`", parse_mode='Markdown')
+        elif payload == "code":
+            await query.message.reply_text("Чтобы использовать интерпретатор кода, отправьте команду:\n`/code <ваша задача>`", parse_mode='Markdown')
         elif payload == "main":
             await main_menu_command(update, context)
 
@@ -617,33 +620,79 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         model = genai.GenerativeModel('gemini-1.5-pro')
         response_stream = await model.generate_content_async(prompt, stream=True)
-        await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
+        await handle_gemini_response_stream(update, response_stream, query_text)
     except Exception as e:
         logger.error(f"Ошибка при выполнении search_command: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при анализе результатов поиска: {e}')
 
 @restricted
-async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выполняет глубокий поиск в интернете для ответа на сложный вопрос."""
-    user_id = update.effective_user.id
-    query_text = " ".join(context.args)
-    if not query_text:
-        await update.message.reply_text("Пожалуйста, укажите ваш вопрос после команды. Например:\n`/deep_search Каковы перспективы развития термоядерной энергетики?`", parse_mode='Markdown')
+async def code_interpreter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует и выполняет Python код в безопасной среде Docker."""
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text(
+            "Пожалуйста, укажите задачу для генерации кода.\n"
+            "Пример: `/code нарисуй график синусоиды и сохрани в plot.png`"
+        )
         return
 
-    await update.message.reply_text(f"🌐 Выполняю глубокий поиск и анализ по запросу: \"{query_text}\". Это может занять до 2 минут...")
+    await update.message.reply_text("⏳ Генерирую Python-код для вашей задачи...")
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
 
     try:
-        # ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ СПОСОБ ВКЛЮЧЕНИЯ ПОИСКА
-        tools = [protos.Tool(google_search_retrieval={})]
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
-        response_stream = await model.generate_content_async(query_text, stream=True)
-        await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
+        model = genai.GenerativeModel('gemini-1.5-pro')
+        code_gen_prompt = (
+            "Ты — ассистент по написанию Python-кода. Напиши полный, готовый к выполнению скрипт для решения следующей задачи. "
+            "Используй только библиотеки matplotlib, numpy, pandas. "
+            "Все файлы с результатами (изображения, csv, txt) сохраняй в папку './output/'. "
+            "Не пытайся получить доступ к сети или файловой системе за пределами текущей папки.\n\n"
+            f"**Задача:** {prompt}"
+        )
+        response = await model.generate_content_async(code_gen_prompt)
+        generated_code = extract_python_code(response.text)
+
+        if not generated_code:
+            await update.message.reply_text("Не удалось сгенерировать исполняемый Python-код для этого запроса. Попробуйте переформулировать задачу.")
+            return
+            
+        await update.message.reply_text(
+            f"✅ Код сгенерирован. Выполняю в безопасной 'песочнице'...\n"
+            f"```python\n{generated_code}\n```",
+            parse_mode='Markdown'
+        )
     except Exception as e:
-        logger.error(f"Ошибка при выполнении deep_search: {e}")
-        await update.message.reply_text(f'К сожалению, произошла ошибка при глубоком поиске: {e}')
+        await update.message.reply_text(f"Произошла ошибка во время генерации кода: {e}")
+        return
+
+    host_temp_dir = None
+    try:
+        logs, output_files, host_temp_dir = await asyncio.to_thread(
+            run_code_in_docker_sync, generated_code
+        )
         
+        if logs:
+            await update.message.reply_text(f"**Вывод консоли:**\n```\n{logs[:3000]}\n```", parse_mode='Markdown')
+
+        if output_files:
+            await update.message.reply_text("**Сгенерированные файлы:**")
+            for file_path in output_files:
+                with open(file_path, 'rb') as f:
+                    filename = os.path.basename(file_path)
+                    if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                        await update.message.reply_photo(f, filename=filename)
+                    else:
+                        await update.message.reply_document(f, filename=filename)
+        
+        if not logs and not output_files:
+            await update.message.reply_text("✅ Код выполнен успешно, не произведя вывода или файлов.")
+
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении кода в Docker: {e}")
+        await update.message.reply_text(f"Произошла критическая ошибка во время выполнения кода: {e}")
+    finally:
+        if host_temp_dir and os.path.exists(host_temp_dir):
+            shutil.rmtree(host_temp_dir)
+            
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -732,7 +781,7 @@ def main() -> None:
     application.add_handler(CommandHandler("delete_chat", delete_chat_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CommandHandler("deep_search", deep_search_command))
+    application.add_handler(CommandHandler("code", code_interpreter_command))
     
     application.add_handler(CallbackQueryHandler(button_callback))
     
@@ -750,4 +799,3 @@ if __name__ == "__main__":
     if not SERPER_API_KEY:
         logger.warning("Ключ SERPER_API_KEY не найден, команда /search не будет работать.")
     main()
-
