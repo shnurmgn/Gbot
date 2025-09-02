@@ -7,7 +7,6 @@ from functools import wraps
 import json
 import docx
 import google.generativeai as genai
-from google.generativeai import protos
 from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -24,6 +23,10 @@ from PIL import Image
 import fitz
 from upstash_redis import Redis
 import requests
+import docker
+import tempfile
+import shutil
+import re
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -44,13 +47,13 @@ try:
     # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
-    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -64,14 +67,64 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
-            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
-            elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
 # --- Вспомогательные функции ---
+
+def run_code_in_docker_sync(code_string: str) -> (str, list, str):
+    """Синхронно запускает код в Docker-контейнере и возвращает результат."""
+    client = docker.from_env()
+    host_temp_dir = tempfile.mkdtemp()
+    output_subdir = os.path.join(host_temp_dir, "output")
+    os.makedirs(output_subdir)
+    
+    try:
+        script_path = os.path.join(host_temp_dir, "script.py")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code_string)
+
+        docker_image = "python:3.10-slim"
+        
+        try:
+            client.images.get(docker_image)
+        except docker.errors.ImageNotFound:
+            logger.info(f"Pulling Docker image: {docker_image}...")
+            client.images.pull(docker_image)
+        
+        container = client.containers.run(
+            image=docker_image,
+            command=["sh", "-c", "pip install matplotlib numpy pandas && python script.py"],
+            volumes={host_temp_dir: {'bind': '/app', 'mode': 'rw'}},
+            working_dir='/app',
+            detach=False,
+            mem_limit="256m",
+            network_disabled=True,
+        )
+        
+        logs = container.decode('utf-8')
+    except docker.errors.ContainerError as e:
+        logs = e.stderr.decode('utf-8')
+    except Exception as e:
+        logs = f"An unexpected error occurred: {e}"
+
+    output_files = []
+    if os.path.exists(output_subdir):
+        for filename in os.listdir(output_subdir):
+            output_files.append(os.path.join(output_subdir, filename))
+            
+    return logs, output_files, host_temp_dir
+
+def extract_python_code(text: str) -> str:
+    """Извлекает код из Markdown-блока ```python ... ```."""
+    match = re.search(r"```python\n(.*?)```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    if "import " in text or "def " in text or "print(" in text:
+        return text.strip()
+    return None
 
 def perform_google_search(query: str) -> str:
     if not SERPER_API_KEY:
@@ -151,7 +204,7 @@ async def handle_gemini_response(update: Update, response):
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
-async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str, is_search: bool = False):
+async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -159,7 +212,6 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
-        
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
@@ -179,33 +231,25 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
              return
 
         await send_long_message(update.message, full_response_text)
-        
-        if not is_search:
-            update_history(update.effective_user.id, user_message_text, full_response_text)
+        update_history(update.effective_user.id, user_message_text, full_response_text)
         
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
-            
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        if placeholder_message: 
-            try:
-                await placeholder_message.delete()
-            except:
-                pass
+        if placeholder_message: await placeholder_message.delete()
         await update.message.reply_text(f"Произошла ошибка при генерации ответа: {e}")
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    active_chat_name = redis_client.get(f"active_chat:{user_id}")
-    return active_chat_name.decode('utf-8') if isinstance(active_chat_name, bytes) else active_chat_name or DEFAULT_CHAT_NAME
+    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
     active_chat = get_active_chat_name(user_id)
     try:
         history_data = redis_client.get(f"history:{user_id}:{active_chat}")
-        return json.loads(history_data.decode('utf-8')) if isinstance(history_data, bytes) else json.loads(history_data) if history_data else []
+        return json.loads(history_data) if history_data else []
     except Exception: return []
 
 def update_history(user_id: int, user_message_text: str, model_response_text: str):
@@ -223,13 +267,12 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model.decode('utf-8') if isinstance(stored_model, bytes) else stored_model or default_model
+        return stored_model if stored_model else default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    persona = redis_client.get(f"persona:{user_id}")
-    return persona.decode('utf-8') if isinstance(persona, bytes) else persona
+    return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
 
@@ -256,9 +299,6 @@ async def get_main_menu_text_and_keyboard(user_id: int):
         ],
         [
             InlineKeyboardButton("🔍 Поиск в интернете", callback_data="menu:search"),
-            InlineKeyboardButton("🌐 Глубокий поиск", callback_data="menu:deep_search")
-        ],
-        [
             InlineKeyboardButton("❓ Помощь", callback_data="menu:help")
         ]
     ]
@@ -279,13 +319,14 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if update.message:
-        await update.message.delete()
+        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
         
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else None
+    target_message = update.callback_query.message if update.callback_query else update.message
     
     try:
-        if target_message:
+        if target_message and not update.message:
             await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
         else:
             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -345,12 +386,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
 Я ваш персональный ассистент, подключенный к мощным нейросетям Google Gemini.
 
 🔍 **Поиск в интернете (`/search`)**
-Быстрый поиск для актуальных вопросов.
+Для вопросов о текущих событиях. 
 Пример: `/search какой сегодня курс доллара`
-
-🌐 **Глубокий поиск (`/deep_search`)**
-Подробный анализ сложных тем с использованием поиска Google.
-Пример: `/deep_search Плюсы и минусы языка Rust`
 
 💬 **Обычный диалог**
 Просто пишите мне. Я помню контекст нашего разговора.
@@ -504,7 +541,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "help":
             await help_command(update, context, from_callback=True)
         elif payload == "search":
-            await query.message.reply_text("Чтобы использовать быстрый поиск, отправьте команду:\n`/search <ваш запрос>`", parse_mode='Markdown')
+            await query.message.reply_text("Чтобы использовать поиск, отправьте команду:\n`/search <ваш запрос>`", parse_mode='Markdown')
         elif payload == "deep_search":
             await query.message.reply_text("Чтобы использовать глубокий поиск, отправьте команду:\n`/deep_search <ваш сложный вопрос>`", parse_mode='Markdown')
         elif payload == "main":
@@ -555,25 +592,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
 
 @restricted
-async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query_text = " ".join(context.args)
-    if not query_text:
-        await update.message.reply_text("Пожалуйста, укажите ваш вопрос после команды. Например:\n`/deep_search Каковы перспективы развития термоядерной энергетики?`", parse_mode='Markdown')
-        return
-
-    await update.message.reply_text(f"🌐 Выполняю глубокий поиск и анализ по запросу: \"{query_text}\". Это может занять до 2 минут...")
-    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
-
-    try:
-        tools = [protos.Tool(google_search_retrieval={})]
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
-        response_stream = await model.generate_content_async(query_text, stream=True)
-        await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
-    except Exception as e:
-        logger.error(f"Ошибка при выполнении deep_search: {e}")
-        await update.message.reply_text(f'К сожалению, произошла ошибка при глубоком поиске: {e}')
-
-@restricted
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = " ".join(context.args)
     if not query_text:
@@ -604,6 +622,28 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при выполнении search_command: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при анализе результатов поиска: {e}')
 
+@restricted
+async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет глубокий поиск в интернете для ответа на сложный вопрос."""
+    user_id = update.effective_user.id
+    query_text = " ".join(context.args)
+    if not query_text:
+        await update.message.reply_text("Пожалуйста, укажите ваш вопрос после команды. Например:\n`/deep_search Каковы перспективы развития термоядерной энергетики?`", parse_mode='Markdown')
+        return
+
+    await update.message.reply_text(f"🌐 Выполняю глубокий поиск и анализ по запросу: \"{query_text}\". Это может занять до 2 минут...")
+    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+
+    try:
+        # ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ СПОСОБ ВКЛЮЧЕНИЯ ПОИСКА
+        tools = [protos.Tool(google_search_retrieval={})]
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
+        response_stream = await model.generate_content_async(query_text, stream=True)
+        await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении deep_search: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при глубоком поиске: {e}')
+        
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
