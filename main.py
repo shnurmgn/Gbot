@@ -132,7 +132,7 @@ async def handle_gemini_response(update: Update, response):
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
-async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
+async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str, is_deep_search: bool = False):
     """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
@@ -162,7 +162,9 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
              return
 
         await send_long_message(update.message, full_response_text)
-        update_history(update.effective_user.id, user_message_text, full_response_text)
+        
+        if not is_deep_search:
+            update_history(update.effective_user.id, user_message_text, full_response_text)
         
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
@@ -178,7 +180,8 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
+    active_chat_name = redis_client.get(f"active_chat:{user_id}")
+    return active_chat_name.decode('utf-8') if active_chat_name else DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
@@ -203,12 +206,13 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model if stored_model else default_model
+        return stored_model.decode('utf-8') if stored_model else default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    return redis_client.get(f"persona:{user_id}")
+    persona = redis_client.get(f"persona:{user_id}")
+    return persona.decode('utf-8') if persona else None
 
 # --- Функции-обработчики ---
 
@@ -230,11 +234,12 @@ async def get_main_menu_text_and_keyboard(user_id: int):
             InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
         ],
         [
-            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
+            InlineKeyboardButton("🗑️ Очистить чат", callback_data="menu:clear"),
             InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
         ],
         [
-            InlineKeyboardButton("❓ Что умеет бот?", callback_data="menu:help")
+            InlineKeyboardButton("🔍 Глубокий поиск", callback_data="menu:deep_search"),
+            InlineKeyboardButton("❓ Помощь", callback_data="menu:help")
         ]
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -321,38 +326,37 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
     help_text = """
 Я ваш персональный ассистент, подключенный к мощным нейросетям Google Gemini.
 
-💬 **Просто общайтесь со мной**
-Напишите любой вопрос или задачу, и я постараюсь помочь.
-Я помню контекст нашего диалога, так что вы можете задавать уточняющие вопросы (например, "а расскажи подробнее о втором пункте?").
+🔍 **Глубокий поиск (`/deep_search`)**
+Для сложных вопросов, требующих анализа информации из интернета, используйте эту команду. 
+Пример: `/deep_search Плюсы и минусы языка программирования Rust`
 
-🤖 **Выбор 'мозга' (`/model`)**
-В главном меню вы можете выбрать модель ИИ, которая лучше всего подходит для вашей задачи: `Pro` для сложных текстов и анализа, `Flash` для быстрых ответов или `Nano Banana` для работы с изображениями. Ваш выбор сохраняется.
+💬 **Обычный диалог**
+Просто пишите мне. Я помню контекст нашего разговора.
+
+🤖 **Выбор 'мозга'**
+В главном меню можно выбрать модель ИИ: `Pro` для анализа, `Flash` для скорости, `Nano Banana` для изображений.
 
 👤 **Настройка личности (`/persona`)**
-Хотите, чтобы я отвечал в определенном стиле? Дайте мне инструкцию!
-Пример: `/persona Ты — пират, и в каждом ответе используешь морской жаргон.`
-Чтобы сбросить личность до стандартной, просто отправьте команду `/persona` без текста.
+Пример: `/persona Ты — пират.`
+Сброс: `/persona` без текста.
 
-🗂️ **Управление диалогами (Чаты)**
-Вы можете вести несколько независимых диалогов для разных проектов.
-• `/new_chat` — начать новый, чистый диалог.
-• `/save_chat <имя>` — сохранить текущий разговор под именем (например, `/save_chat идеи_для_отпуска`).
-• `/load_chat <имя>` — вернуться к сохраненному разговору.
-• `/chats` — посмотреть список всех ваших сохраненных диалогов.
-• `/delete_chat <имя>` — удалить сохраненный диалог.
-• `/clear` — очистить историю только текущего активного диалога.
+🗂️ **Управление чатами**
+• `/new_chat` — начать новый диалог.
+• `/save_chat <имя>`
+• `/load_chat <имя>`
+• `/chats` — список диалогов.
+• `/delete_chat <имя>`
+• `/clear` — очистить текущий диалог.
 
 🖼️ **Работа с изображениями**
-• **Генерация:** Выберите модель "Nano Banana" и попросите меня что-нибудь нарисовать, написав текстом (например, `нарисуй кота в очках программиста`).
-• **Анализ/Редактирование:** Отправьте мне фотографию с подписью-инструкцией (например, `сделай это фото черно-белым` или `что изображено на этой картинке?`).
+• **Генерация:** Выберите `Nano Banana`, напишите `нарисуй кота`.
+• **Анализ:** Отправьте фото с вопросом в подписи.
 
 📄 **Анализ документов**
-Отправьте мне файл (`.pdf`, `.docx` или `.txt`) с вопросом в подписи (например, `сделай краткую выжимку этого отчета на 5 пунктов`). Для этой задачи лучше всего подходят модели `Pro`.
+Отправьте `.pdf`, `.docx` или `.txt` с вопросом в подписи.
 
 📈 **Контроль расходов (`/usage`)**
-Хотите узнать, сколько "ресурсов" я потратил? Отправьте команду `/usage`, чтобы посмотреть статистику использования токенов API за текущий день и месяц.
-
-Чтобы снова увидеть главное меню с кнопками, просто отправьте команду `/start` или `/menu`.
+Показывает статистику использования токенов.
 """
     if from_callback:
         keyboard = [[InlineKeyboardButton("⬅️ Назад в меню", callback_data='menu:main')]]
@@ -483,6 +487,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await usage_command(update, context, from_callback=True)
         elif payload == "help":
             await help_command(update, context, from_callback=True)
+        elif payload == "deep_search":
+            await query.message.reply_text("Чтобы использовать глубокий поиск, отправьте команду:\n`/deep_search <ваш сложный вопрос>`", parse_mode='Markdown')
         elif payload == "main":
             await main_menu_command(update, context)
 
@@ -529,6 +535,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка при обработке текстового сообщения: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
+
+@restricted
+async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет глубокий поиск в интернете для ответа на сложный вопрос."""
+    user_id = update.effective_user.id
+    query_text = " ".join(context.args)
+    if not query_text:
+        await update.message.reply_text("Пожалуйста, укажите ваш вопрос после команды. Например:\n`/deep_search Каковы перспективы развития термоядерной энергетики в ближайшие 20 лет?`", parse_mode='Markdown')
+        return
+
+    await update.message.reply_text(f"🔍 Начинаю глубокий анализ по запросу: \"{query_text}\". Это может занять до 2 минут...")
+    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+
+    try:
+        # Используем мощную модель и включаем инструмент поиска
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=['google_search'])
+        response_stream = await model.generate_content_async(query_text, stream=True)
+        await handle_gemini_response_stream(update, response_stream, query_text, is_deep_search=True)
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении deep_search: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при глубоком поиске: {e}')
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -603,8 +630,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     
-    # Увеличиваем таймауты для http-запросов
-    request = HTTPXRequest(connect_timeout=20, read_timeout=30)
+    # Увеличиваем таймауты для всех http-запросов
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     
     application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
@@ -617,6 +644,7 @@ def main() -> None:
     application.add_handler(CommandHandler("chats", list_chats_command))
     application.add_handler(CommandHandler("delete_chat", delete_chat_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("deep_search", deep_search_command))
     
     application.add_handler(CallbackQueryHandler(button_callback))
     
@@ -633,3 +661,4 @@ if __name__ == "__main__":
         logger.critical("Не все переменные окружения или подключения настроены! Бот не может запуститься.")
     else:
         main()
+
