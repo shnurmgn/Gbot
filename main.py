@@ -7,7 +7,7 @@ from functools import wraps
 import json
 import docx
 import google.generativeai as genai
-from google.generativeai import protos # <-- ВАЖНЫЙ ИМПОРТ для Deep Search
+from google.generativeai import protos
 from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -18,7 +18,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    Defaults,
 )
 from telegram.request import HTTPXRequest
 from PIL import Image
@@ -40,6 +39,7 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
+    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN')
@@ -87,6 +87,7 @@ def update_usage_stats(user_id: int, usage_metadata):
         logger.error(f"Ошибка обновления статистики использования: {e}")
 
 async def send_long_message(message: telegram.Message, text: str):
+    """Надежно отправляет длинные сообщения, с фолбэком на простой текст при ошибке разметки."""
     if not text.strip(): return
     chunks = [text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH)]
     
@@ -104,6 +105,7 @@ async def send_long_message(message: telegram.Message, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
+    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -132,6 +134,7 @@ async def handle_gemini_response(update: Update, response):
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
 async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str, is_deep_search: bool = False):
+    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -146,14 +149,15 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
                 current_time = time.time()
                 if current_time - last_update_time > update_interval:
                     try:
-                        if len(full_response_text) < TELEGRAM_MAX_MESSAGE_LENGTH - 10:
-                            await placeholder_message.edit_text(full_response_text + " ✍️")
-                            last_update_time = current_time
+                        # ВАЖНО: Редактируем без Markdown, чтобы избежать ошибок
+                        await placeholder_message.edit_text(full_response_text + " ✍️")
+                        last_update_time = current_time
                     except telegram.error.BadRequest:
                         pass
         
         await placeholder_message.delete()
         
+        # Проверяем, не пустой ли ответ ПОСЛЕ завершения стрима
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
              return
@@ -178,14 +182,14 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
     active_chat_name = redis_client.get(f"active_chat:{user_id}")
-    return active_chat_name if active_chat_name else DEFAULT_CHAT_NAME
+    return active_chat_name.decode('utf-8') if isinstance(active_chat_name, bytes) else active_chat_name or DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
     active_chat = get_active_chat_name(user_id)
     try:
         history_data = redis_client.get(f"history:{user_id}:{active_chat}")
-        return json.loads(history_data) if history_data else []
+        return json.loads(history_data.decode('utf-8')) if isinstance(history_data, bytes) else json.loads(history_data) if history_data else []
     except Exception: return []
 
 def update_history(user_id: int, user_message_text: str, model_response_text: str):
@@ -203,12 +207,13 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model if stored_model else default_model
+        return stored_model.decode('utf-8') if isinstance(stored_model, bytes) else stored_model or default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    return redis_client.get(f"persona:{user_id}")
+    persona = redis_client.get(f"persona:{user_id}")
+    return persona.decode('utf-8') if isinstance(persona, bytes) else persona
 
 # --- Функции-обработчики ---
 
@@ -543,7 +548,6 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
 
     try:
-        # ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ СПОСОБ ВКЛЮЧЕНИЯ ПОИСКА
         tools = [protos.Tool(google_search_retrieval={})]
         model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
         response_stream = await model.generate_content_async(query_text, stream=True)
@@ -649,7 +653,7 @@ def main() -> None:
     application.add_handler(MessageHandler(supported_files_filter, handle_document_message))
     
     logger.info("Бот запущен и работает в режиме опроса...")
-    application.run_polling()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     if not all([TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, ALLOWED_USER_IDS_STR, redis_client]):
