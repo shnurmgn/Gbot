@@ -18,7 +18,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    Defaults,
 )
 from telegram.request import HTTPXRequest
 from PIL import Image
@@ -46,10 +45,10 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -251,15 +250,14 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    active_chat_name = redis_client.get(f"active_chat:{user_id}")
-    return active_chat_name.decode('utf-8') if isinstance(active_chat_name, bytes) else active_chat_name or DEFAULT_CHAT_NAME
+    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
     active_chat = get_active_chat_name(user_id)
     try:
         history_data = redis_client.get(f"history:{user_id}:{active_chat}")
-        return json.loads(history_data.decode('utf-8')) if isinstance(history_data, bytes) else json.loads(history_data) if history_data else []
+        return json.loads(history_data) if history_data else []
     except Exception: return []
 
 def update_history(user_id: int, user_message_text: str, model_response_text: str):
@@ -277,13 +275,12 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model.decode('utf-8') if isinstance(stored_model, bytes) else stored_model or default_model
+        return stored_model if stored_model else default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    persona = redis_client.get(f"persona:{user_id}")
-    return persona.decode('utf-8') if isinstance(persona, bytes) else persona
+    return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
 
@@ -655,7 +652,7 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         tools = [protos.Tool(google_search_retrieval={})]
-        model = genai.GenerativeModel(model_name='gemini-2.5-pro', tools=tools)
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
         response_stream = await model.generate_content_async(query_text, stream=True)
         await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
     except Exception as e:
