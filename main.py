@@ -260,19 +260,19 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if update.message:
-        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
+        await update.message.delete()
         
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else update.message
+    target_message = update.callback_query.message if update.callback_query else None
     
     try:
-        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except (AttributeError, telegram.error.BadRequest):
-        if update.message:
-            try: await update.message.delete()
-            except: pass
-        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        if target_message:
+            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" not in str(e):
+             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
