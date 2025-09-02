@@ -152,7 +152,7 @@ async def handle_gemini_response(update: Update, response):
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
-async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str, is_deep_search: bool = False):
+async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -160,7 +160,6 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
-        
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
@@ -180,20 +179,13 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
              return
 
         await send_long_message(update.message, full_response_text)
-        
-        if not is_deep_search:
-            update_history(update.effective_user.id, user_message_text, full_response_text)
+        update_history(update.effective_user.id, user_message_text, full_response_text)
         
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
-            
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        if placeholder_message: 
-            try:
-                await placeholder_message.delete()
-            except:
-                pass
+        if placeholder_message: await placeholder_message.delete()
         await update.message.reply_text(f"Произошла ошибка при генерации ответа: {e}")
 
 def get_active_chat_name(user_id: int) -> str:
@@ -275,10 +267,13 @@ async def get_chats_submenu_text_and_keyboard():
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
     if update.message:
         await update.message.delete()
+        
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     target_message = update.callback_query.message if update.callback_query else None
+    
     try:
         if target_message:
             await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -643,7 +638,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Ошибка при обработке документа: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
 
-# --- Точка входа для сервера ---
+# --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     
