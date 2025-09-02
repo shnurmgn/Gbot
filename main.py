@@ -90,7 +90,7 @@ def run_code_in_docker_sync(code_string: str) -> (str, list, str):
             client.images.get(docker_image)
         except docker.errors.ImageNotFound:
             logger.info(f"Pulling Docker image: {docker_image}...")
-            client.images.pull("python:3.10-slim")
+            base_image = client.images.pull("python:3.10-slim")
             container = client.containers.run(
                 "python:3.10-slim",
                 "pip install matplotlib numpy pandas",
@@ -328,13 +328,10 @@ async def get_chats_submenu_text_and_keyboard():
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
     if update.message:
         await update.message.delete()
-        
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
     target_message = update.callback_query.message if update.callback_query else None
-    
     try:
         if target_message:
             await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
