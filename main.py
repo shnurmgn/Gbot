@@ -43,7 +43,6 @@ try:
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True # Эта опция правильная, она возвращает строки
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
