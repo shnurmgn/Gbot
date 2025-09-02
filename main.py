@@ -7,6 +7,7 @@ from functools import wraps
 import json
 import docx
 import google.generativeai as genai
+from google.generativeai import protos # <-- ВАЖНЫЙ ИМПОРТ для Deep Search
 from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -39,10 +40,9 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -177,8 +177,8 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    # ИСПРАВЛЕНИЕ: Убираем .decode(), так как decode_responses=True уже все сделал
-    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
+    active_chat_name = redis_client.get(f"active_chat:{user_id}")
+    return active_chat_name if active_chat_name else DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
@@ -203,13 +203,11 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        # ИСПРАВЛЕНИЕ: Убираем .decode()
         return stored_model if stored_model else default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    # ИСПРАВЛЕНИЕ: Убираем .decode()
     return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
@@ -257,19 +255,19 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if update.message:
-        await update.message.delete()
+        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
         
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else None
+    target_message = update.callback_query.message if update.callback_query else update.message
     
     try:
-        if target_message:
-            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-        else:
-            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except telegram.error.BadRequest as e:
-        if "Message is not modified" not in str(e):
-             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except (AttributeError, telegram.error.BadRequest):
+        if update.message:
+            try: await update.message.delete()
+            except: pass
+        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
@@ -545,8 +543,9 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
 
     try:
-        # Используем мощную модель и включаем инструмент поиска
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=['google_search'])
+        # ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ СПОСОБ ВКЛЮЧЕНИЯ ПОИСКА
+        tools = [protos.Tool(google_search_retrieval={})]
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
         response_stream = await model.generate_content_async(query_text, stream=True)
         await handle_gemini_response_stream(update, response_stream, query_text, is_deep_search=True)
     except Exception as e:
