@@ -259,8 +259,8 @@ async def get_chats_submenu_text_and_keyboard():
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
+    # Принудительно удаляем старую текстовую клавиатуру, если она была
     if update.message:
-        # Принудительно удаляем старую текстовую клавиатуру, если она была
         await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
         
