@@ -74,7 +74,6 @@ def restricted(func):
 # --- Вспомогательные функции ---
 
 def perform_google_search(query: str) -> str:
-    """Выполняет поиск через Serper.dev и возвращает отформатированный результат."""
     if not SERPER_API_KEY:
         return "Ошибка: Ключ API для поиска (SERPER_API_KEY) не настроен."
     headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
@@ -152,7 +151,7 @@ async def handle_gemini_response(update: Update, response):
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
-async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str, is_deep_search: bool = False):
+async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str, is_search: bool = False):
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -181,7 +180,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
 
         await send_long_message(update.message, full_response_text)
         
-        if not is_deep_search:
+        if not is_search:
             update_history(update.effective_user.id, user_message_text, full_response_text)
         
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
@@ -256,7 +255,10 @@ async def get_main_menu_text_and_keyboard(user_id: int):
             InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
         ],
         [
-            InlineKeyboardButton("🔍 Глубокий поиск", callback_data="menu:deep_search"),
+            InlineKeyboardButton("🔍 Поиск в интернете", callback_data="menu:search"),
+            InlineKeyboardButton("🌐 Глубокий поиск", callback_data="menu:deep_search")
+        ],
+        [
             InlineKeyboardButton("❓ Помощь", callback_data="menu:help")
         ]
     ]
@@ -343,8 +345,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
 Я ваш персональный ассистент, подключенный к мощным нейросетям Google Gemini.
 
 🔍 **Поиск в интернете (`/search`)**
-Для вопросов о текущих событиях. 
+Быстрый поиск для актуальных вопросов.
 Пример: `/search какой сегодня курс доллара`
+
+🌐 **Глубокий поиск (`/deep_search`)**
+Подробный анализ сложных тем с использованием поиска Google.
+Пример: `/deep_search Плюсы и минусы языка Rust`
 
 💬 **Обычный диалог**
 Просто пишите мне. Я помню контекст нашего разговора.
@@ -498,7 +504,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "help":
             await help_command(update, context, from_callback=True)
         elif payload == "search":
-            await query.message.reply_text("Чтобы использовать поиск, отправьте команду:\n`/search <ваш запрос>`", parse_mode='Markdown')
+            await query.message.reply_text("Чтобы использовать быстрый поиск, отправьте команду:\n`/search <ваш запрос>`", parse_mode='Markdown')
+        elif payload == "deep_search":
+            await query.message.reply_text("Чтобы использовать глубокий поиск, отправьте команду:\n`/deep_search <ваш сложный вопрос>`", parse_mode='Markdown')
         elif payload == "main":
             await main_menu_command(update, context)
 
@@ -545,6 +553,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка при обработке текстового сообщения: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
+
+@restricted
+async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query_text = " ".join(context.args)
+    if not query_text:
+        await update.message.reply_text("Пожалуйста, укажите ваш вопрос после команды. Например:\n`/deep_search Каковы перспективы развития термоядерной энергетики?`", parse_mode='Markdown')
+        return
+
+    await update.message.reply_text(f"🌐 Выполняю глубокий поиск и анализ по запросу: \"{query_text}\". Это может занять до 2 минут...")
+    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+
+    try:
+        tools = [protos.Tool(google_search_retrieval={})]
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
+        response_stream = await model.generate_content_async(query_text, stream=True)
+        await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении deep_search: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при глубоком поиске: {e}')
 
 @restricted
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -665,6 +692,7 @@ def main() -> None:
     application.add_handler(CommandHandler("delete_chat", delete_chat_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("deep_search", deep_search_command))
     
     application.add_handler(CallbackQueryHandler(button_callback))
     
