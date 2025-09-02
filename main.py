@@ -7,6 +7,7 @@ from functools import wraps
 import json
 import docx
 import google.generativeai as genai
+from google.generativeai import protos
 from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -44,14 +45,16 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
+    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -65,6 +68,7 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
@@ -74,25 +78,20 @@ def restricted(func):
 # --- Вспомогательные функции ---
 
 def run_code_in_docker_sync(code_string: str) -> (str, list, str):
-    """Синхронно запускает код в Docker-контейнере и возвращает результат."""
     client = docker.from_env()
     host_temp_dir = tempfile.mkdtemp()
     output_subdir = os.path.join(host_temp_dir, "output")
     os.makedirs(output_subdir)
-    
     try:
         script_path = os.path.join(host_temp_dir, "script.py")
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(code_string)
-
         docker_image = "python:3.10-slim"
-        
         try:
             client.images.get(docker_image)
         except docker.errors.ImageNotFound:
             logger.info(f"Pulling Docker image: {docker_image}...")
             client.images.pull(docker_image)
-        
         container = client.containers.run(
             image=docker_image,
             command=["sh", "-c", "pip install matplotlib numpy pandas && python script.py"],
@@ -102,22 +101,18 @@ def run_code_in_docker_sync(code_string: str) -> (str, list, str):
             mem_limit="256m",
             network_disabled=True,
         )
-        
         logs = container.decode('utf-8')
     except docker.errors.ContainerError as e:
         logs = e.stderr.decode('utf-8')
     except Exception as e:
         logs = f"An unexpected error occurred: {e}"
-
     output_files = []
     if os.path.exists(output_subdir):
         for filename in os.listdir(output_subdir):
             output_files.append(os.path.join(output_subdir, filename))
-            
     return logs, output_files, host_temp_dir
 
 def extract_python_code(text: str) -> str:
-    """Извлекает код из Markdown-блока ```python ... ```."""
     match = re.search(r"```python\n(.*?)```", text, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -211,6 +206,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
+        
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
@@ -236,21 +232,27 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
         
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
+            
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        if placeholder_message: await placeholder_message.delete()
+        if placeholder_message: 
+            try:
+                await placeholder_message.delete()
+            except:
+                pass
         await update.message.reply_text(f"Произошла ошибка при генерации ответа: {e}")
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
+    active_chat_name = redis_client.get(f"active_chat:{user_id}")
+    return active_chat_name.decode('utf-8') if isinstance(active_chat_name, bytes) else active_chat_name or DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
     active_chat = get_active_chat_name(user_id)
     try:
         history_data = redis_client.get(f"history:{user_id}:{active_chat}")
-        return json.loads(history_data) if history_data else []
+        return json.loads(history_data.decode('utf-8')) if isinstance(history_data, bytes) else json.loads(history_data) if history_data else []
     except Exception: return []
 
 def update_history(user_id: int, user_message_text: str, model_response_text: str):
@@ -268,12 +270,13 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model if stored_model else default_model
+        return stored_model.decode('utf-8') if isinstance(stored_model, bytes) else stored_model or default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    return redis_client.get(f"persona:{user_id}")
+    persona = redis_client.get(f"persona:{user_id}")
+    return persona.decode('utf-8') if isinstance(persona, bytes) else persona
 
 # --- Функции-обработчики ---
 
