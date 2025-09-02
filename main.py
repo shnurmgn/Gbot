@@ -17,8 +17,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    Defaults,
 )
+from telegram.request import HTTPXRequest
 from PIL import Image
 import fitz
 from upstash_redis import Redis
@@ -259,20 +259,19 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if update.message:
-        # Принудительно удаляем старую текстовую клавиатуру, если она была
-        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
+        await update.message.delete()
         
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else update.message
+    target_message = update.callback_query.message if update.callback_query else None
     
     try:
-        await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except (AttributeError, telegram.error.BadRequest):
-        if update.message:
-            try: await update.message.delete()
-            except: pass
-        await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        if target_message:
+            await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" not in str(e):
+             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
@@ -548,7 +547,6 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
 
     try:
-        # Используем мощную модель и включаем инструмент поиска
         model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=['google_search'])
         response_stream = await model.generate_content_async(query_text, stream=True)
         await handle_gemini_response_stream(update, response_stream, query_text, is_deep_search=True)
@@ -625,12 +623,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Ошибка при обработке документа: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
 
-# --- Точка входа для сервера ---
+# --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     
     # Увеличиваем таймауты для всех http-запросов
-    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     
     application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
@@ -660,3 +658,4 @@ if __name__ == "__main__":
         logger.critical("Не все переменные окружения или подключения настроены! Бот не может запуститься.")
     else:
         main()
+
