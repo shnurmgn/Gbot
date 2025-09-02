@@ -17,6 +17,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    Defaults,
 )
 from telegram.request import HTTPXRequest
 from PIL import Image
@@ -40,15 +41,16 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
+    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
-        decode_responses=True
+        token=os.environ.get('UPSTASH_REDIS_TOKEN')
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
+    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -62,6 +64,7 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
@@ -71,11 +74,10 @@ def restricted(func):
 # --- Вспомогательные функции ---
 
 def perform_google_search(query: str) -> str:
-    """Выполняет поиск через Serper.dev и возвращает отформатированный результат."""
     if not SERPER_API_KEY:
         return "Ошибка: Ключ API для поиска (SERPER_API_KEY) не настроен."
     headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
-    payload = json.dumps({"q": query, "gl": "ru", "hl": "ru"}) # Искать в России на русском
+    payload = json.dumps({"q": query, "gl": "ru", "hl": "ru"})
     try:
         response = requests.post("https://google.serper.dev/search", headers=headers, data=payload, timeout=10)
         response.raise_for_status()
@@ -187,14 +189,15 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
+    active_chat_name = redis_client.get(f"active_chat:{user_id}")
+    return active_chat_name.decode('utf-8') if isinstance(active_chat_name, bytes) else active_chat_name or DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
     active_chat = get_active_chat_name(user_id)
     try:
         history_data = redis_client.get(f"history:{user_id}:{active_chat}")
-        return json.loads(history_data) if history_data else []
+        return json.loads(history_data.decode('utf-8')) if isinstance(history_data, bytes) else json.loads(history_data) if history_data else []
     except Exception: return []
 
 def update_history(user_id: int, user_message_text: str, model_response_text: str):
@@ -212,12 +215,13 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model if stored_model else default_model
+        return stored_model.decode('utf-8') if isinstance(stored_model, bytes) else stored_model or default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    return redis_client.get(f"persona:{user_id}")
+    persona = redis_client.get(f"persona:{user_id}")
+    return persona.decode('utf-8') if isinstance(persona, bytes) else persona
 
 # --- Функции-обработчики ---
 
@@ -262,12 +266,16 @@ async def get_chats_submenu_text_and_keyboard():
 @restricted
 async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
     if update.message:
-        await update.message.delete()
+        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
+        
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else None
+    target_message = update.callback_query.message if update.callback_query else update.message
+    
     try:
-        if target_message:
+        if target_message and not update.message:
             await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
         else:
             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -563,15 +571,80 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in IMAGE_GEN_MODELS:
+        await update.message.reply_text("Чтобы работать с фото, выберите модель 'Nano Banana' через /menu.")
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    caption = update.message.caption or "Опиши это изображение"
+    await update.message.reply_chat_action(telegram.constants.ChatAction.UPLOAD_PHOTO)
+    try:
+        photo_bytes = io.BytesIO()
+        await photo_file.download_to_memory(photo_bytes)
+        photo_bytes.seek(0)
+        img = Image.open(photo_bytes)
+        model_gemini = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model_gemini.generate_content_async([caption, img])
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке фото: {e}')
 
 @restricted
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    user_id = update.effective_user.id
+    model_name = get_user_model(user_id)
+    persona = get_user_persona(user_id)
+    if model_name not in DOCUMENT_ANALYSIS_MODELS:
+        await update.message.reply_text(f"Для анализа документов, пожалуйста, выберите модель Pro.")
+        return
+    doc = update.message.document
+    caption = update.message.caption or "Проанализируй этот документ и сделай краткую выжимку."
+    await update.message.reply_text(f"Получил файл: {doc.file_name}.\nНачинаю обработку...")
+    try:
+        doc_file = await doc.get_file()
+        file_bytes_io = io.BytesIO()
+        await doc_file.download_to_memory(file_bytes_io)
+        file_bytes_io.seek(0)
+        content_parts = [caption]
+        if doc.mime_type == 'application/pdf':
+            pdf_document = fitz.open(stream=file_bytes_io.read(), filetype="pdf")
+            page_limit = 25 
+            num_pages = min(len(pdf_document), page_limit)
+            for page_num in range(num_pages):
+                page = pdf_document.load_page(page_num)
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_bytes))
+                content_parts.append(img)
+            pdf_document.close()
+            await update.message.reply_text(f"Отправляю первые {num_pages} страниц PDF в Gemini на анализ...")
+        elif doc.mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            document = docx.Document(file_bytes_io)
+            file_text_content = "\n".join([para.text for para in document.paragraphs])
+            content_parts.append(file_text_content)
+        elif doc.mime_type == 'text/plain':
+            file_text_content = file_bytes_io.read().decode('utf-8')
+            content_parts.append(file_text_content)
+        else:
+            await update.message.reply_text(f"Извините, я пока не поддерживаю файлы типа {doc.mime_type}.")
+            return
+        model = genai.GenerativeModel(model_name, system_instruction=persona)
+        response = await model.generate_content_async(content_parts)
+        await handle_gemini_response(update, response)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке документа: {e}")
+        await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
 
 # --- Точка входа для сервера ---
 def main() -> None:
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    logger.info("Создание и настройка приложения...")
+    
+    # Увеличиваем таймауты для всех http-запросов
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0)
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     
     application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
@@ -597,7 +670,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     if not all([TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, ALLOWED_USER_IDS_STR, redis_client]):
-        logger.warning("Не все переменные окружения настроены! Некоторые функции могут не работать.")
+        logger.warning("Не все переменные окружения или подключения настроены! Некоторые функции могут не работать.")
     if not SERPER_API_KEY:
         logger.warning("Ключ SERPER_API_KEY не найден, команда /search не будет работать.")
     main()
