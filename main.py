@@ -45,10 +45,10 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -250,15 +250,14 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    active_chat_name = redis_client.get(f"active_chat:{user_id}")
-    return active_chat_name.decode('utf-8') if isinstance(active_chat_name, bytes) else active_chat_name or DEFAULT_CHAT_NAME
+    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
     active_chat = get_active_chat_name(user_id)
     try:
         history_data = redis_client.get(f"history:{user_id}:{active_chat}")
-        return json.loads(history_data.decode('utf-8')) if isinstance(history_data, bytes) else json.loads(history_data) if history_data else []
+        return json.loads(history_data) if history_data else []
     except Exception: return []
 
 def update_history(user_id: int, user_message_text: str, model_response_text: str):
@@ -276,13 +275,12 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model.decode('utf-8') if isinstance(stored_model, bytes) else stored_model or default_model
+        return stored_model if stored_model else default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    persona = redis_client.get(f"persona:{user_id}")
-    return persona.decode('utf-8') if isinstance(persona, bytes) else persona
+    return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
 
@@ -638,7 +636,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        model = genai.GenerativeModel('gemini-1.5-pro')
+        model = genai.GenerativeModel('gemini-2.5-pro')
         response_stream = await model.generate_content_async(prompt, stream=True)
         await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
     except Exception as e:
@@ -657,7 +655,7 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         tools = [protos.Tool(google_search_retrieval={})]
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
+        model = genai.GenerativeModel(model_name='gemini-2.5-pro', tools=tools)
         response_stream = await model.generate_content_async(query_text, stream=True)
         await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
     except Exception as e:
@@ -679,13 +677,16 @@ async def code_interpreter_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
 
     try:
-        model = genai.GenerativeModel('gemini-1.5-pro')
+        model = genai.GenerativeModel('gemini-2.5-pro')
         code_gen_prompt = (
-            "Ты — ассистент по написанию Python-кода. Напиши полный, готовый к выполнению скрипт для решения следующей задачи. "
-            "Используй только библиотеки matplotlib, numpy, pandas. "
-            "Все файлы с результатами (изображения, csv, txt) сохраняй в папку './output/'. "
-            "Не пытайся получить доступ к сети или файловой системе за пределами текущей папки.\n\n"
-            f"**Задача:** {prompt}"
+            "Ты — ассистент по написанию Python-кода для выполнения в изолированной среде Docker.\n"
+            "ПРАВИЛА:\n"
+            "1. Пиши полный, самодостаточный и готовый к выполнению скрипт.\n"
+            "2. Ты можешь использовать библиотеки: matplotlib, numpy, pandas.\n"
+            "3. Все файлы с результатами (изображения, csv, txt) сохраняй в папку './output/'.\n"
+            "4. ВАЖНО: для работы с текстовыми данными в памяти (например, для чтения строки в DataFrame) используй `from io import StringIO`, а НЕ устаревшую `pandas.StringIO`.\n"
+            "5. Не пытайся получить доступ к сети или файловой системе за пределами текущей папки.\n\n"
+            f"**ЗАДАЧА:** {prompt}"
         )
         response = await model.generate_content_async(code_gen_prompt)
         generated_code = extract_python_code(response.text)
