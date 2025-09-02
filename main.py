@@ -17,8 +17,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    Defaults,
 )
-from telegram.request import HTTPXRequest
 from PIL import Image
 import fitz
 from upstash_redis import Redis
@@ -38,16 +38,15 @@ DEFAULT_CHAT_NAME = "default"
 # --- Подключение к Upstash Redis ---
 redis_client = None
 try:
-    # Финальная, правильная версия без decode_responses
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
-        token=os.environ.get('UPSTASH_REDIS_TOKEN')
+        token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True # Эта опция правильная, она возвращает строки
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
 except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
-    redis_client = None
 
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -61,7 +60,6 @@ def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
-            logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
@@ -86,7 +84,6 @@ def update_usage_stats(user_id: int, usage_metadata):
         logger.error(f"Ошибка обновления статистики использования: {e}")
 
 async def send_long_message(message: telegram.Message, text: str):
-    """Надежно отправляет длинные сообщения, с фолбэком на простой текст при ошибке разметки."""
     if not text.strip(): return
     chunks = [text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH)]
     
@@ -104,7 +101,6 @@ async def send_long_message(message: telegram.Message, text: str):
             await asyncio.sleep(0.5)
 
 async def handle_gemini_response(update: Update, response):
-    """Обрабатывает НЕ-стриминговые ответы (фото, документы, генерация изображений)."""
     if hasattr(response, 'usage_metadata'):
         update_usage_stats(update.effective_user.id, response.usage_metadata)
     try:
@@ -132,8 +128,7 @@ async def handle_gemini_response(update: Update, response):
         logger.error(f"Критическая ошибка при обработке ответа от Gemini: {e}")
         await update.message.reply_text(f"Произошла критическая ошибка при обработке ответа: {e}")
 
-async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str, is_deep_search: bool = False):
-    """Обрабатывает потоковый ответ, редактируя сообщение, а в конце отправляя результат."""
+async def handle_gemini_response_stream(update: Update, response_stream, user_message_text: str):
     placeholder_message = None
     full_response_text = ""
     last_update_time = 0
@@ -141,47 +136,39 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
     try:
         placeholder_message = await update.message.reply_text("...")
         last_update_time = time.time()
-        
         async for chunk in response_stream:
             if hasattr(chunk, 'text') and chunk.text:
                 full_response_text += chunk.text
                 current_time = time.time()
                 if current_time - last_update_time > update_interval:
                     try:
-                        # ВАЖНО: Редактируем без Markdown, чтобы избежать ошибок
-                        await placeholder_message.edit_text(full_response_text + " ✍️")
-                        last_update_time = current_time
+                        if len(full_response_text) < TELEGRAM_MAX_MESSAGE_LENGTH - 10:
+                            await placeholder_message.edit_text(full_response_text + " ✍️")
+                            last_update_time = current_time
                     except telegram.error.BadRequest:
                         pass
         
         await placeholder_message.delete()
         
-        # Проверяем, не пустой ли ответ ПОСЛЕ завершения стрима
         if not full_response_text.strip():
              await update.message.reply_text("Модель завершила работу, но не сгенерировала ответ. Попробуйте переформулировать ваш запрос.")
              return
 
         await send_long_message(update.message, full_response_text)
-        
-        if not is_deep_search:
-            update_history(update.effective_user.id, user_message_text, full_response_text)
+        update_history(update.effective_user.id, user_message_text, full_response_text)
         
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
             
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        if placeholder_message: 
-            try:
-                await placeholder_message.delete()
-            except:
-                pass
+        if placeholder_message: await placeholder_message.delete()
         await update.message.reply_text(f"Произошла ошибка при генерации ответа: {e}")
 
 def get_active_chat_name(user_id: int) -> str:
     if not redis_client: return DEFAULT_CHAT_NAME
-    active_chat_name = redis_client.get(f"active_chat:{user_id}")
-    return active_chat_name.decode('utf-8') if active_chat_name else DEFAULT_CHAT_NAME
+    # ИСПРАВЛЕНИЕ: Убираем .decode(), так как decode_responses=True уже все сделал
+    return redis_client.get(f"active_chat:{user_id}") or DEFAULT_CHAT_NAME
 
 def get_history(user_id: int) -> list:
     if not redis_client: return []
@@ -206,13 +193,14 @@ def get_user_model(user_id: int) -> str:
     if not redis_client: return default_model
     try:
         stored_model = redis_client.get(f"user:{user_id}:model")
-        return stored_model.decode('utf-8') if stored_model else default_model
+        # ИСПРАВЛЕНИЕ: Убираем .decode()
+        return stored_model if stored_model else default_model
     except Exception: return default_model
 
 def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
-    persona = redis_client.get(f"persona:{user_id}")
-    return persona.decode('utf-8') if persona else None
+    # ИСПРАВЛЕНИЕ: Убираем .decode()
+    return redis_client.get(f"persona:{user_id}")
 
 # --- Функции-обработчики ---
 
@@ -234,12 +222,11 @@ async def get_main_menu_text_and_keyboard(user_id: int):
             InlineKeyboardButton("💬 Управление чатами", callback_data="menu:open_chats_submenu")
         ],
         [
-            InlineKeyboardButton("🗑️ Очистить чат", callback_data="menu:clear"),
+            InlineKeyboardButton("🗑️ Очистить текущий чат", callback_data="menu:clear"),
             InlineKeyboardButton("📈 Статистика", callback_data="menu:usage")
         ],
         [
-            InlineKeyboardButton("🔍 Глубокий поиск", callback_data="menu:deep_search"),
-            InlineKeyboardButton("❓ Помощь", callback_data="menu:help")
+            InlineKeyboardButton("❓ Что умеет бот?", callback_data="menu:help")
         ]
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -259,13 +246,14 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if update.message:
-        await update.message.delete()
+        await update.message.reply_text("Меню:", reply_markup=ReplyKeyboardRemove())
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id + 1)
         
     menu_text, reply_markup = await get_main_menu_text_and_keyboard(user_id)
-    target_message = update.callback_query.message if update.callback_query else None
+    target_message = update.callback_query.message if update.callback_query else update.message
     
     try:
-        if target_message:
+        if target_message and not update.message:
             await target_message.edit_text(menu_text, reply_markup=reply_markup, parse_mode='Markdown')
         else:
             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
@@ -324,37 +312,38 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
     help_text = """
 Я ваш персональный ассистент, подключенный к мощным нейросетям Google Gemini.
 
-🔍 **Глубокий поиск (`/deep_search`)**
-Для сложных вопросов, требующих анализа информации из интернета, используйте эту команду. 
-Пример: `/deep_search Плюсы и минусы языка программирования Rust`
+💬 **Просто общайтесь со мной**
+Напишите любой вопрос или задачу, и я постараюсь помочь.
+Я помню контекст нашего диалога, так что вы можете задавать уточняющие вопросы (например, "а расскажи подробнее о втором пункте?").
 
-💬 **Обычный диалог**
-Просто пишите мне. Я помню контекст нашего разговора.
-
-🤖 **Выбор 'мозга'**
-В главном меню можно выбрать модель ИИ: `Pro` для анализа, `Flash` для скорости, `Nano Banana` для изображений.
+🤖 **Выбор 'мозга' (`/model`)**
+В главном меню вы можете выбрать модель ИИ, которая лучше всего подходит для вашей задачи: `Pro` для сложных текстов и анализа, `Flash` для быстрых ответов или `Nano Banana` для работы с изображениями. Ваш выбор сохраняется.
 
 👤 **Настройка личности (`/persona`)**
-Пример: `/persona Ты — пират.`
-Сброс: `/persona` без текста.
+Хотите, чтобы я отвечал в определенном стиле? Дайте мне инструкцию!
+Пример: `/persona Ты — пират, и в каждом ответе используешь морской жаргон.`
+Чтобы сбросить личность до стандартной, просто отправьте команду `/persona` без текста.
 
-🗂️ **Управление чатами**
-• `/new_chat` — начать новый диалог.
-• `/save_chat <имя>`
-• `/load_chat <имя>`
-• `/chats` — список диалогов.
-• `/delete_chat <имя>`
-• `/clear` — очистить текущий диалог.
+🗂️ **Управление диалогами (Чаты)**
+Вы можете вести несколько независимых диалогов для разных проектов.
+• `/new_chat` — начать новый, чистый диалог.
+• `/save_chat <имя>` — сохранить текущий разговор под именем (например, `/save_chat идеи_для_отпуска`).
+• `/load_chat <имя>` — вернуться к сохраненному разговору.
+• `/chats` — посмотреть список всех ваших сохраненных диалогов.
+• `/delete_chat <имя>` — удалить сохраненный диалог.
+• `/clear` — очистить историю только текущего активного диалога.
 
 🖼️ **Работа с изображениями**
-• **Генерация:** Выберите `Nano Banana`, напишите `нарисуй кота`.
-• **Анализ:** Отправьте фото с вопросом в подписи.
+• **Генерация:** Выберите модель "Nano Banana" и попросите меня что-нибудь нарисовать, написав текстом (например, `нарисуй кота в очках программиста`).
+• **Анализ/Редактирование:** Отправьте мне фотографию с подписью-инструкцией (например, `сделай это фото черно-белым` или `что изображено на этой картинке?`).
 
 📄 **Анализ документов**
-Отправьте `.pdf`, `.docx` или `.txt` с вопросом в подписи.
+Отправьте мне файл (`.pdf`, `.docx` или `.txt`) с вопросом в подписи (например, `сделай краткую выжимку этого отчета на 5 пунктов`). Для этой задачи лучше всего подходят модели `Pro`.
 
 📈 **Контроль расходов (`/usage`)**
-Показывает статистику использования токенов.
+Хотите узнать, сколько "ресурсов" я потратил? Отправьте команду `/usage`, чтобы посмотреть статистику использования токенов API за текущий день и месяц.
+
+Чтобы снова увидеть главное меню с кнопками, просто отправьте команду `/start` или `/menu`.
 """
     if from_callback:
         keyboard = [[InlineKeyboardButton("⬅️ Назад в меню", callback_data='menu:main')]]
@@ -485,8 +474,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await usage_command(update, context, from_callback=True)
         elif payload == "help":
             await help_command(update, context, from_callback=True)
-        elif payload == "deep_search":
-            await query.message.reply_text("Чтобы использовать глубокий поиск, отправьте команду:\n`/deep_search <ваш сложный вопрос>`", parse_mode='Markdown')
         elif payload == "main":
             await main_menu_command(update, context)
 
@@ -533,26 +520,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка при обработке текстового сообщения: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
-
-@restricted
-async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выполняет глубокий поиск в интернете для ответа на сложный вопрос."""
-    user_id = update.effective_user.id
-    query_text = " ".join(context.args)
-    if not query_text:
-        await update.message.reply_text("Пожалуйста, укажите ваш вопрос после команды. Например:\n`/deep_search Каковы перспективы развития термоядерной энергетики в ближайшие 20 лет?`", parse_mode='Markdown')
-        return
-
-    await update.message.reply_text(f"🔍 Начинаю глубокий анализ по запросу: \"{query_text}\". Это может занять до 2 минут...")
-    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
-
-    try:
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=['google_search'])
-        response_stream = await model.generate_content_async(query_text, stream=True)
-        await handle_gemini_response_stream(update, response_stream, query_text, is_deep_search=True)
-    except Exception as e:
-        logger.error(f"Ошибка при выполнении deep_search: {e}")
-        await update.message.reply_text(f'К сожалению, произошла ошибка при глубоком поиске: {e}')
 
 @restricted
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
