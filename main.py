@@ -651,7 +651,7 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         tools = [protos.Tool(google_search_retrieval={})]
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
+        model = genai.GenerativeModel(model_name='gemini-2.5-pro', tools=tools)
         response_stream = await model.generate_content_async(query_text, stream=True)
         await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
     except Exception as e:
@@ -797,6 +797,38 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Ошибка при обработке документа: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка при обработке документа: {e}')
+        
+@restricted
+async def test_api_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет чистый тестовый запрос к Gemini с функцией Deep Search для диагностики."""
+    await update.message.reply_text("🔬 Запускаю диагностический тест для Deep Search API...")
+    try:
+        tools = [protos.Tool(google_search_retrieval={})]
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
+        
+        # Используем не-потоковый запрос для чистоты теста
+        response = await model.generate_content_async("What is the latest news about AI?")
+        
+        if response.text:
+            await update.message.reply_text(
+                f"✅ **УСПЕХ!**\n\n"
+                f"API-вызов с Deep Search прошел успешно.\n\n"
+                f"**Ответ:**\n`{response.text[:1000]}`..."
+            )
+        else:
+             await update.message.reply_text(
+                f"✅ **УСПЕХ (с нюансом)!**\n\n"
+                f"API-вызов прошел успешно, но модель вернула пустой ответ. "
+                f"Это может быть связано с фильтрами безопасности.\n\n"
+                f"**Причина завершения:** `{response.candidates[0].finish_reason.name}`"
+             )
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **ПРОВАЛ!**\n\n"
+            f"API-вызов завершился ошибкой:\n\n"
+            f"`{type(e).__name__}: {e}`"
+        )
 
 # --- Точка входа для постоянной работы на сервере ---
 def main() -> None:
@@ -819,6 +851,7 @@ def main() -> None:
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("deep_search", deep_search_command))
     application.add_handler(CommandHandler("code", code_interpreter_command))
+    application.add_handler(CommandHandler("test_api", test_api_command))
     
     application.add_handler(CallbackQueryHandler(button_callback))
     
