@@ -48,6 +48,7 @@ try:
     redis_client = Redis(
         url=os.environ.get('UPSTASH_REDIS_URL'),
         token=os.environ.get('UPSTASH_REDIS_TOKEN'),
+        decode_responses=True
     )
     redis_client.ping()
     logging.info("Успешно подключено к Upstash Redis.")
@@ -238,7 +239,6 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
         
         if hasattr(response_stream, 'usage_metadata') and response_stream.usage_metadata:
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
-            
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
         if placeholder_message: 
@@ -402,7 +402,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
 Пример: `/search какой сегодня курс доллара`
 
 🌐 **Глубокий поиск (`/deep_search`)**
-Подробный анализ сложных тем (требует спец. настроек Google Cloud).
+Подробный анализ сложных тем.
 Пример: `/deep_search Плюсы и минусы языка Rust`
 
 💬 **Обычный диалог**
