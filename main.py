@@ -651,7 +651,7 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         tools = [protos.Tool(google_search_retrieval={})]
-        model = genai.GenerativeModel(model_name='gemini-2.5-pro', tools=tools)
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
         response_stream = await model.generate_content_async(query_text, stream=True)
         await handle_gemini_response_stream(update, response_stream, query_text, is_search=True)
     except Exception as e:
