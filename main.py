@@ -36,10 +36,15 @@ ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 SERPER_API_KEY = os.environ.get('SERPER_API_KEY')
 
+# --- НОВОЕ: Настройка администратора ---
+ADMIN_USER_ID_STR = os.environ.get('ADMIN_USER_ID')
+ADMIN_USER_ID = int(ADMIN_USER_ID_STR) if ADMIN_USER_ID_STR else (ALLOWED_USER_IDS[0] if ALLOWED_USER_IDS else None)
+ALLOWED_USERS_REDIS_KEY = "bot:allowed_users"
+
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
-HISTORY_LIMIT = 10 
+HISTORY_LIMIT = 10
 DEFAULT_CHAT_NAME = "default"
 
 # --- Подключение к Upstash Redis ---
@@ -61,18 +66,42 @@ logger = logging.getLogger(__name__)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# --- Декоратор для проверки авторизации ---
+# --- ИЗМЕНЕНО: Декораторы для проверки авторизации ---
 def restricted(func):
+    """Декоратор для ограничения доступа к боту. Проверяет ID пользователя по списку в Redis."""
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
-        if user_id not in ALLOWED_USER_IDS:
+        
+        is_allowed = False
+        if redis_client:
+            # Проверяем наличие пользователя в наборе Redis
+            is_allowed = redis_client.sismember(ALLOWED_USERS_REDIS_KEY, user_id)
+        else: # Резервный вариант, если Redis недоступен
+            is_allowed = user_id in ALLOWED_USER_IDS
+
+        if not is_allowed:
             logger.warning(f"Неавторизованный доступ отклонен для пользователя с ID: {user_id}")
             if update.message: await update.message.reply_text("⛔️ У вас нет доступа к этому боту.")
             elif update.callback_query: await update.callback_query.answer("⛔️ У вас нет доступа.", show_alert=True)
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
+
+# --- НОВОЕ: Декоратор только для администратора ---
+def admin_only(func):
+    """Декоратор для ограничения доступа к функциям только для администратора."""
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id != ADMIN_USER_ID:
+            logger.warning(f"Попытка доступа к админ-функции пользователем {user_id}.")
+            if update.message: await update.message.reply_text("⛔️ Эта команда доступна только администратору.")
+            elif update.callback_query: await update.callback_query.answer("⛔️ Только для администратора.", show_alert=True)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
 
 # --- Вспомогательные функции ---
 
@@ -240,7 +269,7 @@ async def handle_gemini_response_stream(update: Update, response_stream, user_me
             update_usage_stats(update.effective_user.id, response_stream.usage_metadata)
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке стриминг-ответа от Gemini: {e}")
-        if placeholder_message: 
+        if placeholder_message:
             try:
                 await placeholder_message.delete()
             except:
@@ -283,6 +312,7 @@ def get_user_persona(user_id: int) -> str:
 
 # --- Функции-обработчики ---
 
+# --- ИЗМЕНЕНО: Добавлена кнопка управления пользователями для администратора ---
 async def get_main_menu_text_and_keyboard(user_id: int):
     model_name = get_user_model(user_id)
     active_chat = get_active_chat_name(user_id)
@@ -308,11 +338,17 @@ async def get_main_menu_text_and_keyboard(user_id: int):
             InlineKeyboardButton("🔍 Поиск", callback_data="menu:search"),
             InlineKeyboardButton("🌐 Deep Search", callback_data="menu:deep_search"),
             InlineKeyboardButton("💻 Код", callback_data="menu:code")
-        ],
-        [
-            InlineKeyboardButton("❓ Помощь", callback_data="menu:help")
         ]
     ]
+    # Добавляем кнопку администрирования, если пользователь — админ
+    if user_id == ADMIN_USER_ID:
+        keyboard.append(
+            [InlineKeyboardButton("👑 Управление пользователями", callback_data="admin:menu")]
+        )
+    
+    keyboard.append(
+        [InlineKeyboardButton("❓ Помощь", callback_data="menu:help")]
+    )
     return text, InlineKeyboardMarkup(keyboard)
 
 async def get_chats_submenu_text_and_keyboard():
@@ -322,6 +358,19 @@ async def get_chats_submenu_text_and_keyboard():
         [InlineKeyboardButton("📥 Сохранить текущий чат", callback_data="chats:save")],
         [InlineKeyboardButton("➕ Новый чат", callback_data="chats:new")],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+# --- НОВОЕ: Меню администратора ---
+async def get_admin_menu_text_and_keyboard():
+    text = "👑 **Панель администратора**\n\nВыберите действие:"
+    keyboard = [
+        [
+            InlineKeyboardButton("➕ Добавить пользователя", callback_data="admin:add_user_prompt"),
+            InlineKeyboardButton("➖ Удалить пользователя", callback_data="admin:del_user_prompt")
+        ],
+        [InlineKeyboardButton("📋 Список пользователей", callback_data="admin:list_users")],
+        [InlineKeyboardButton("⬅️ Назад в главное меню", callback_data="menu:main")]
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -339,7 +388,7 @@ async def main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
     except telegram.error.BadRequest as e:
         if "Message is not modified" not in str(e):
-             await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
+              await context.bot.send_message(chat_id=user_id, text=menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def clear_history_logic(update: Update):
     user_id = update.effective_user.id
@@ -531,6 +580,98 @@ async def delete_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await update.message.reply_text(f"Чат `{chat_name}` удален.", parse_mode='Markdown')
 
+# --- НОВЫЕ: Функции управления пользователями ---
+@admin_only
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not redis_client:
+        await update.message.reply_text("Ошибка: Redis не подключен. Управление пользователями невозможно.")
+        return
+
+    try:
+        # Пытаемся получить ID из аргументов команды
+        user_to_add_id = int(context.args[0])
+        user_info_text = f"ID `{user_to_add_id}`"
+    except (IndexError, ValueError):
+        # Если аргументов нет или они некорректны, проверяем, является ли сообщение ответом
+        if update.message.reply_to_message:
+            user_to_add = update.message.reply_to_message.from_user
+            user_to_add_id = user_to_add.id
+            user_info_text = f"пользователь @{user_to_add.username} (ID: `{user_to_add_id}`)"
+        else:
+            await update.message.reply_text(
+                "Чтобы добавить пользователя, используйте команду `/adduser <ID>` "
+                "или ответьте на сообщение пользователя этой командой."
+            )
+            return
+
+    if redis_client.sismember(ALLOWED_USERS_REDIS_KEY, user_to_add_id):
+        await update.message.reply_text(f"Пользователь {user_info_text} уже имеет доступ.", parse_mode='Markdown')
+        return
+
+    redis_client.sadd(ALLOWED_USERS_REDIS_KEY, user_to_add_id)
+    await update.message.reply_text(f"✅ Доступ предоставлен: {user_info_text}.", parse_mode='Markdown')
+
+
+@admin_only
+async def del_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not redis_client:
+        await update.message.reply_text("Ошибка: Redis не подключен. Управление пользователями невозможно.")
+        return
+
+    try:
+        user_to_del_id = int(context.args[0])
+        user_info_text = f"ID `{user_to_del_id}`"
+    except (IndexError, ValueError):
+        if update.message.reply_to_message:
+            user_to_del = update.message.reply_to_message.from_user
+            user_to_del_id = user_to_del.id
+            user_info_text = f"пользователь @{user_to_del.username} (ID: `{user_to_del_id}`)"
+        else:
+            await update.message.reply_text(
+                "Чтобы удалить пользователя, используйте команду `/deluser <ID>` "
+                "или ответьте на сообщение пользователя этой командой."
+            )
+            return
+
+    if user_to_del_id == ADMIN_USER_ID:
+        await update.message.reply_text("⛔️ Нельзя удалить администратора.", parse_mode='Markdown')
+        return
+
+    if not redis_client.sismember(ALLOWED_USERS_REDIS_KEY, user_to_del_id):
+        await update.message.reply_text(f"Пользователь {user_info_text} не найден в списке доступа.", parse_mode='Markdown')
+        return
+
+    redis_client.srem(ALLOWED_USERS_REDIS_KEY, user_to_del_id)
+    await update.message.reply_text(f"🗑️ Доступ отозван: {user_info_text}.", parse_mode='Markdown')
+
+
+async def list_users_logic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Логика для получения списка пользователей, возвращает готовый текст."""
+    if not redis_client:
+        return "Ошибка: Redis не подключен. Управление пользователями невозможно."
+    
+    user_ids = redis_client.smembers(ALLOWED_USERS_REDIS_KEY)
+    if not user_ids:
+        return "Список разрешенных пользователей пуст."
+    
+    message = "👥 **Список пользователей с доступом:**\n\n"
+    for user_id in user_ids:
+        user_id_int = int(user_id)
+        if user_id_int == ADMIN_USER_ID:
+            message += f"👑 `{user_id_int}` (Администратор)\n"
+        else:
+            message += f"👤 `{user_id_int}`\n"
+    return message
+
+
+@admin_only
+async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /listusers."""
+    response_text = await list_users_logic(update, context)
+    await update.message.reply_text(response_text, parse_mode='Markdown')
+
+
+# --- ИЗМЕНЕНО: Добавлен обработчик кнопок администратора ---
 @restricted
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -572,6 +713,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif payload == "new":
             await new_chat_command(update, context, from_callback=True)
             await main_menu_command(update, context)
+            
+    elif command == "admin":
+        if query.from_user.id != ADMIN_USER_ID:
+            await query.answer("⛔️ Только для администратора.", show_alert=True)
+            return
+            
+        if payload == "menu":
+            admin_menu_text, admin_reply_markup = await get_admin_menu_text_and_keyboard()
+            await query.edit_message_text(admin_menu_text, reply_markup=admin_reply_markup, parse_mode='Markdown')
+        elif payload == "add_user_prompt":
+            await query.message.reply_text(
+                "Чтобы добавить пользователя, отправьте команду:\n`/adduser <ID>`\n"
+                "Или ответьте на любое сообщение нужного пользователя командой `/adduser`.",
+                parse_mode='Markdown'
+            )
+        elif payload == "del_user_prompt":
+            await query.message.reply_text(
+                "Чтобы удалить пользователя, отправьте команду:\n`/deluser <ID>`\n"
+                "Или ответьте на любое сообщение нужного пользователя командой `/deluser`.",
+                parse_mode='Markdown'
+            )
+        elif payload == "list_users":
+            response_text = await list_users_logic(update, context)
+            keyboard = [[InlineKeyboardButton("⬅️ Назад в админ-меню", callback_data='admin:menu')]]
+            await query.edit_message_text(response_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             
     elif command == "select_model":
         user_id = query.from_user.id
@@ -771,7 +937,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         content_parts = [caption]
         if doc.mime_type == 'application/pdf':
             pdf_document = fitz.open(stream=file_bytes_io.read(), filetype="pdf")
-            page_limit = 25 
+            page_limit = 25
             num_pages = min(len(pdf_document), page_limit)
             for page_num in range(num_pages):
                 page = pdf_document.load_page(page_num)
@@ -830,14 +996,37 @@ async def test_api_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"`{type(e).__name__}: {e}`"
         )
 
-# --- Точка входа для постоянной работы на сервере ---
+# --- ИЗМЕНЕНО: Добавлена инициализация пользователей и регистрация админ-команд ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
+    
+    # --- НОВОЕ: Инициализация списка пользователей в Redis ---
+    if redis_client:
+        if not redis_client.exists(ALLOWED_USERS_REDIS_KEY):
+            logger.info(f"Ключ '{ALLOWED_USERS_REDIS_KEY}' не найден в Redis. Инициализация из переменной окружения...")
+            if ALLOWED_USER_IDS:
+                redis_client.sadd(ALLOWED_USERS_REDIS_KEY, *ALLOWED_USER_IDS)
+                logger.info(f"Добавлено {len(ALLOWED_USER_IDS)} пользователей в Redis.")
+            else:
+                logger.warning("Переменная окружения ALLOWED_USER_IDS пуста, в Redis не добавлено ни одного пользователя.")
+        
+        # Убедимся, что администратор всегда имеет доступ
+        if ADMIN_USER_ID:
+            is_admin_member = redis_client.sismember(ALLOWED_USERS_REDIS_KEY, ADMIN_USER_ID)
+            if not is_admin_member:
+                redis_client.sadd(ALLOWED_USERS_REDIS_KEY, ADMIN_USER_ID)
+                logger.info(f"Администратор (ID: {ADMIN_USER_ID}) добавлен в список разрешенных пользователей.")
     
     # Увеличиваем таймауты для всех http-запросов
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     
+    # --- НОВОЕ: Админ-команды ---
+    application.add_handler(CommandHandler("adduser", add_user_command))
+    application.add_handler(CommandHandler("deluser", del_user_command))
+    application.add_handler(CommandHandler("listusers", list_users_command))
+
+    # --- Пользовательские команды ---
     application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
     application.add_handler(CommandHandler("usage", usage_command))
@@ -868,4 +1057,7 @@ if __name__ == "__main__":
         logger.warning("Не все переменные окружения или подключения настроены! Некоторые функции могут не работать.")
     if not SERPER_API_KEY:
         logger.warning("Ключ SERPER_API_KEY не найден, команда /search не будет работать.")
-    main()
+    if not ADMIN_USER_ID:
+        logger.error("Критическая ошибка: не удалось определить ID администратора. Проверьте переменные ADMIN_USER_ID и ALLOWED_USER_IDS.")
+    else:
+        main()
