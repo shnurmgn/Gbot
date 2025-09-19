@@ -7,8 +7,14 @@ import time
 from functools import wraps
 import json
 import docx
+
+# --- ИСПРАВЛЕННЫЕ ИМПОРТЫ ---
+# Этот импорт для текста, изображений и т.д.
 import google.generativeai as genai 
+# Этот импорт специально для клиента Veo, с псевдонимом во избежание конфликта
+from google import genai as google_ai_client
 from google.generativeai import protos
+
 from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -32,7 +38,6 @@ import re
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') 
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 SERPER_API_KEY = os.environ.get('SERPER_API_KEY')
@@ -67,11 +72,15 @@ except Exception as e:
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Конфигурируем библиотеку. Она сама найдет GOOGLE_APPLICATION_CREDENTIALS.
-genai.configure()
-
-# Инициализируем синхронный клиент для Veo. Он также найдет креды автоматически.
-sync_genai_client = genai.Client()
+# --- ИСПРАВЛЕНА ИНИЦИАЛИЗАЦИЯ ---
+sync_video_client = None
+try:
+    # Конфигурируем основной клиент для текста и картинок
+    genai.configure()
+    # Создаем отдельный синхронный клиент для видео
+    sync_video_client = google_ai_client.Client()
+except Exception as e:
+    logger.error(f"Не удалось настроить Google API клиенты. Убедитесь, что GOOGLE_APPLICATION_CREDENTIALS настроены верно. Ошибка: {e}")
 
 
 # --- Декораторы для проверки авторизации ---
@@ -750,7 +759,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not sync_genai_client:
+    if not sync_video_client:
         logger.error("Попытка генерации видео без инициализированного клиента. Проверьте аутентификацию (GOOGLE_APPLICATION_CREDENTIALS).")
         await update.message.reply_text("⛔️ Ошибка конфигурации: сервис генерации видео недоступен. Проверьте учетные данные на стороне сервера.")
         return
@@ -772,7 +781,7 @@ async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_
     try:
         def _generate_and_poll_sync():
             logger.info(f"Запуск синхронной задачи генерации видео с промптом: {prompt}")
-            operation = sync_genai_client.models.generate_videos(
+            operation = sync_video_client.models.generate_videos(
                 model="veo-3.0-generate-001",
                 prompt=prompt,
             )
@@ -780,7 +789,8 @@ async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_
             logger.info("Видео генерируется... Ожидание завершения операции.")
             while not operation.done:
                 time.sleep(10)
-                operation = sync_genai_client.operations.get(operation.name)
+                # В документации используется передача всего объекта operation
+                operation = sync_video_client.operations.get(operation)
 
             logger.info("Генерация видео завершена. Скачивание файла...")
             generated_video = operation.response.generated_videos[0]
@@ -1108,19 +1118,16 @@ def main() -> None:
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # Проверяем наличие ключевых переменных для работы
     if not all([TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS_STR, redis_client]):
         logger.error("Критическая ошибка: не заданы TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS или не удалось подключиться к Redis.")
         sys.exit(1)
 
-    try:
-        # Проверяем, что аутентификация Google работает
-        sync_genai_client.models.get("gemini-pro") # Простой вызов для проверки аутентификации
-        logger.info("Аутентификация Google API прошла успешно.")
-    except Exception as e:
-        logger.error(f"Критическая ошибка: не удалось аутентифицироваться в Google API. "
-                     f"Убедитесь, что переменная GOOGLE_APPLICATION_CREDENTIALS установлена правильно. Ошибка: {e}")
+    if not sync_video_client:
+        logger.error(f"Критическая ошибка: не удалось аутентифицироваться в Google API и создать клиент для видео. "
+                     f"Убедитесь, что переменная GOOGLE_APPLICATION_CREDENTIALS установлена правильно.")
         sys.exit(1)
+    
+    logger.info("Аутентификация Google API прошла успешно.")
 
     if not SERPER_API_KEY:
         logger.warning("Ключ SERPER_API_KEY не найден, команда /search не будет работать.")
@@ -1129,5 +1136,4 @@ if __name__ == "__main__":
         logger.error("Критическая ошибка: не удалось определить ID администратора. Проверьте переменные ADMIN_USER_ID и ALLOWED_USER_IDS.")
         sys.exit(1)
     
-    # Запускаем основную функцию, если все критические проверки пройдены
     main()
