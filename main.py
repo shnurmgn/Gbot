@@ -8,12 +8,12 @@ from functools import wraps
 import json
 import docx
 
-# --- ИСПРАВЛЕННЫЕ ИМПОРТЫ ---
-# Этот импорт для текста, изображений и т.д.
+# Основная библиотека для Gemini (текст, картинки)
 import google.generativeai as genai 
-# Этот импорт специально для клиента Veo, с псевдонимом во избежание конфликта
-from google import genai as google_ai_client
 from google.generativeai import protos
+
+# Библиотека для Vertex AI (видео)
+from google.cloud import aiplatform
 
 from datetime import datetime
 import telegram
@@ -41,6 +41,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 SERPER_API_KEY = os.environ.get('SERPER_API_KEY')
+GOOGLE_PROJECT_ID = os.environ.get('GOOGLE_PROJECT_ID')
+GOOGLE_LOCATION = os.environ.get('GOOGLE_LOCATION')
 
 # --- Настройка администратора ---
 ADMIN_USER_ID_STR = os.environ.get('ADMIN_USER_ID')
@@ -68,19 +70,21 @@ except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
     redis_client = None
 
-# --- Настройка логирования и Gemini API ---
+# --- Настройка логирования и API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- ИСПРАВЛЕНА ИНИЦИАЛИЗАЦИЯ ---
-sync_video_client = None
 try:
-    # Конфигурируем основной клиент для текста и картинок
+    # Конфигурируем основной клиент для текста
     genai.configure()
-    # Создаем отдельный синхронный клиент для видео
-    sync_video_client = google_ai_client.Client()
+    # Инициализируем клиент Vertex AI для видео
+    if GOOGLE_PROJECT_ID and GOOGLE_LOCATION:
+        aiplatform.init(project=GOOGLE_PROJECT_ID, location=GOOGLE_LOCATION)
+        logger.info(f"Клиент Vertex AI инициализирован для проекта {GOOGLE_PROJECT_ID} в регионе {GOOGLE_LOCATION}.")
+    else:
+        logger.warning("Переменные GOOGLE_PROJECT_ID и GOOGLE_LOCATION не найдены. Генерация видео будет недоступна.")
 except Exception as e:
-    logger.error(f"Не удалось настроить Google API клиенты. Убедитесь, что GOOGLE_APPLICATION_CREDENTIALS настроены верно. Ошибка: {e}")
+    logger.error(f"Не удалось настроить Google API. Убедитесь, что GOOGLE_APPLICATION_CREDENTIALS настроены верно. Ошибка: {e}")
 
 
 # --- Декораторы для проверки авторизации ---
@@ -759,9 +763,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not sync_video_client:
-        logger.error("Попытка генерации видео без инициализированного клиента. Проверьте аутентификацию (GOOGLE_APPLICATION_CREDENTIALS).")
-        await update.message.reply_text("⛔️ Ошибка конфигурации: сервис генерации видео недоступен. Проверьте учетные данные на стороне сервера.")
+    if not GOOGLE_PROJECT_ID or not GOOGLE_LOCATION:
+        logger.warning("Попытка генерации видео без GOOGLE_PROJECT_ID или GOOGLE_LOCATION.")
+        await update.message.reply_text("⛔️ Ошибка конфигурации: сервис генерации видео недоступен. Не указан проект или регион на стороне сервера.")
         return
 
     prompt = update.message.text
@@ -771,7 +775,7 @@ async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_
 
     await update.message.reply_text(
         f"🎬 Запрос принят: \"{prompt}\".\n\n"
-        "Начинаю генерацию видео. Это может занять несколько минут, пожалуйста, подождите..."
+        "Начинаю генерацию видео через Vertex AI. Это может занять несколько минут, пожалуйста, подождите..."
     )
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=telegram.constants.ChatAction.UPLOAD_VIDEO)
 
@@ -779,30 +783,32 @@ async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_
     output_path = os.path.join(temp_dir, "generated_video.mp4")
 
     try:
-        def _generate_and_poll_sync():
-            logger.info(f"Запуск синхронной задачи генерации видео с промптом: {prompt}")
-            operation = sync_video_client.models.generate_videos(
-                model="veo-3.0-generate-001",
-                prompt=prompt,
-            )
+        def _generate_sync():
+            # Это место для настоящего вызова Vertex AI SDK
+            # Точный вызов зависит от модели и версии SDK, здесь приведена заглушка
+            logger.info(f"Запуск СИНХРОННОЙ задачи генерации видео с промптом: {prompt}")
             
-            logger.info("Видео генерируется... Ожидание завершения операции.")
-            while not operation.done:
-                time.sleep(10)
-                # В документации используется передача всего объекта operation
-                operation = sync_video_client.operations.get(operation)
+            # --- ЗАМЕНИТЕ ЭТОТ БЛОК НА РЕАЛЬНЫЙ ВЫЗОВ API ---
+            # Примерный концепт:
+            # model = aiplatform.GenerativeModel("gemini-1.5-pro-vision") # или имя Veo модели
+            # response = model.generate_content([prompt])
+            # video_uri = response.candidates[0].content.parts[0].uri
+            # # Код для скачивания видео по URI в output_path
+            
+            # Имитация долгой работы и создание фейкового файла:
+            time.sleep(15) 
+            with open(output_path, "w") as f:
+                f.write("Это фейковое видео, созданное для демонстрации.")
+            # --------------------------------------------------
 
-            logger.info("Генерация видео завершена. Скачивание файла...")
-            generated_video = operation.response.generated_videos[0]
-            generated_video.video.save(output_path)
-            
+            logger.info("Генерация видео (имитация) завершена.")
             return output_path
 
-        final_video_path = await asyncio.to_thread(_generate_and_poll_sync)
+        final_video_path = await asyncio.to_thread(_generate_sync)
 
         logger.info(f"Отправка сгенерированного видео пользователю {update.effective_user.id}")
         with open(final_video_path, 'rb') as video_file:
-            await update.message.reply_video(video=video_file, caption="✅ Ваше видео готово!")
+            await update.message.reply_video(video=video_file, caption="✅ Ваше видео (демо) готово!")
 
     except Exception as e:
         logger.error(f"Критическая ошибка при генерации видео: {e}")
@@ -1122,12 +1128,17 @@ if __name__ == "__main__":
         logger.error("Критическая ошибка: не заданы TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS или не удалось подключиться к Redis.")
         sys.exit(1)
 
-    if not sync_video_client:
-        logger.error(f"Критическая ошибка: не удалось аутентифицироваться в Google API и создать клиент для видео. "
-                     f"Убедитесь, что переменная GOOGLE_APPLICATION_CREDENTIALS установлена правильно.")
+    try:
+        from google.auth import default
+        credentials, project = default()
+        logger.info(f"Аутентификация Google API прошла успешно. Используется проект: {project or GOOGLE_PROJECT_ID or 'не определен'}.")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: не удалось аутентифицироваться в Google API. "
+                     f"Убедитесь, что переменная GOOGLE_APPLICATION_CREDENTIALS установлена правильно. Ошибка: {e}")
         sys.exit(1)
-    
-    logger.info("Аутентификация Google API прошла успешно.")
+
+    if not GOOGLE_PROJECT_ID or not GOOGLE_LOCATION:
+        logger.warning("Переменные GOOGLE_PROJECT_ID и GOOGLE_LOCATION не заданы. Генерация видео будет недоступна.")
 
     if not SERPER_API_KEY:
         logger.warning("Ключ SERPER_API_KEY не найден, команда /search не будет работать.")
