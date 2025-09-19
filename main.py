@@ -6,12 +6,9 @@ import time
 from functools import wraps
 import json
 import docx
-
-# --- ИЗМЕНЕНИЯ ДЛЯ VEO ---
 import google.generativeai as genai 
 from google.generativeai import client as genai_client 
 from google.generativeai import protos
-
 from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -35,7 +32,8 @@ import re
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+# Ключ GEMINI_API_KEY больше не является основным для аутентификации, но может быть оставлен для обратной совместимости
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') 
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 SERPER_API_KEY = os.environ.get('SERPER_API_KEY')
@@ -66,14 +64,16 @@ except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
     redis_client = None
 
-# --- Настройка логирования и Gemini API ---
+# --- Настройка логирования и Gemini API (ИСПРАВЛЕНО) ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-sync_genai_client = None
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Инициализация синхронного клиента для Veo
-    sync_genai_client = genai_client.Client(api_key=GEMINI_API_KEY)
+
+# Конфигурируем библиотеку. Она сама найдет GOOGLE_APPLICATION_CREDENTIALS.
+genai.configure()
+
+# Инициализируем синхронный клиент для Veo. Он также найдет креды автоматически.
+sync_genai_client = genai_client.Client()
+
 
 # --- Декораторы для проверки авторизации ---
 def restricted(func):
@@ -751,6 +751,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not sync_genai_client:
+        logger.error("Попытка генерации видео без инициализированного клиента. Проверьте аутентификацию (GOOGLE_APPLICATION_CREDENTIALS).")
+        await update.message.reply_text("⛔️ Ошибка конфигурации: сервис генерации видео недоступен. Проверьте учетные данные на стороне сервера.")
+        return
+
     prompt = update.message.text
     if not prompt:
         await update.message.reply_text("Пожалуйста, введите текстовый запрос для генерации видео.")
@@ -1104,8 +1109,20 @@ def main() -> None:
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    if not all([TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, ALLOWED_USER_IDS_STR, redis_client]):
-        logger.warning("Не все переменные окружения или подключения настроены! Некоторые функции могут не работать.")
+    # Проверяем наличие ключевых переменных для работы
+    if not all([TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS_STR, redis_client]):
+        logger.error("Критическая ошибка: не заданы TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS или не удалось подключиться к Redis.")
+        return # Выходим, если базовые настройки отсутствуют
+
+    try:
+        # Проверяем, что аутентификация Google работает
+        sync_genai_client.models.get("gemini-pro") # Простой вызов для проверки аутентификации
+        logger.info("Аутентификация Google API прошла успешно.")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: не удалось аутентифицироваться в Google API. "
+                     f"Убедитесь, что переменная GOOGLE_APPLICATION_CREDENTIALS установлена правильно. Ошибка: {e}")
+        return
+
     if not SERPER_API_KEY:
         logger.warning("Ключ SERPER_API_KEY не найден, команда /search не будет работать.")
     if not ADMIN_USER_ID:
