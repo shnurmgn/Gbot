@@ -6,8 +6,12 @@ import time
 from functools import wraps
 import json
 import docx
-import google.generativeai as genai
+
+# --- ИЗМЕНЕНИЯ ДЛЯ VEO ---
+import google.generativeai as genai 
+from google.generativeai import client as genai_client 
 from google.generativeai import protos
+
 from datetime import datetime
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -36,14 +40,16 @@ ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
 SERPER_API_KEY = os.environ.get('SERPER_API_KEY')
 
-# --- НОВОЕ: Настройка администратора ---
+# --- Настройка администратора ---
 ADMIN_USER_ID_STR = os.environ.get('ADMIN_USER_ID')
 ADMIN_USER_ID = int(ADMIN_USER_ID_STR) if ADMIN_USER_ID_STR else (ALLOWED_USER_IDS[0] if ALLOWED_USER_IDS else None)
 ALLOWED_USERS_REDIS_KEY = "bot:allowed_users"
 
+# --- Константы моделей ---
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 DOCUMENT_ANALYSIS_MODELS = ['gemini-1.5-pro', 'gemini-2.5-pro']
 IMAGE_GEN_MODELS = ['gemini-2.5-flash-image-preview']
+VIDEO_GEN_MODELS = ['veo-3.0-generate-001']
 HISTORY_LIMIT = 10
 DEFAULT_CHAT_NAME = "default"
 
@@ -63,10 +69,13 @@ except Exception as e:
 # --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+sync_genai_client = None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+    # Инициализация синхронного клиента для Veo
+    sync_genai_client = genai_client.Client(api_key=GEMINI_API_KEY)
 
-# --- ИЗМЕНЕНО: Декораторы для проверки авторизации ---
+# --- Декораторы для проверки авторизации ---
 def restricted(func):
     """Декоратор для ограничения доступа к боту. Проверяет ID пользователя по списку в Redis."""
     @wraps(func)
@@ -75,9 +84,8 @@ def restricted(func):
         
         is_allowed = False
         if redis_client:
-            # Проверяем наличие пользователя в наборе Redis
             is_allowed = redis_client.sismember(ALLOWED_USERS_REDIS_KEY, user_id)
-        else: # Резервный вариант, если Redis недоступен
+        else:
             is_allowed = user_id in ALLOWED_USER_IDS
 
         if not is_allowed:
@@ -88,7 +96,6 @@ def restricted(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-# --- НОВОЕ: Декоратор только для администратора ---
 def admin_only(func):
     """Декоратор для ограничения доступа к функциям только для администратора."""
     @wraps(func)
@@ -119,7 +126,7 @@ def run_code_in_docker_sync(code_string: str) -> (str, list, str):
             client.images.get(docker_image)
         except docker.errors.ImageNotFound:
             logger.info(f"Pulling Docker image: {docker_image}...")
-            base_image = client.images.pull("python:3.10-slim")
+            client.images.pull("python:3.10-slim")
             container = client.containers.run(
                 "python:3.10-slim",
                 "pip install matplotlib numpy pandas",
@@ -310,9 +317,9 @@ def get_user_persona(user_id: int) -> str:
     if not redis_client: return None
     return redis_client.get(f"persona:{user_id}")
 
+
 # --- Функции-обработчики ---
 
-# --- ИЗМЕНЕНО: Добавлена кнопка управления пользователями для администратора ---
 async def get_main_menu_text_and_keyboard(user_id: int):
     model_name = get_user_model(user_id)
     active_chat = get_active_chat_name(user_id)
@@ -340,7 +347,6 @@ async def get_main_menu_text_and_keyboard(user_id: int):
             InlineKeyboardButton("💻 Код", callback_data="menu:code")
         ]
     ]
-    # Добавляем кнопку администрирования, если пользователь — админ
     if user_id == ADMIN_USER_ID:
         keyboard.append(
             [InlineKeyboardButton("👑 Управление пользователями", callback_data="admin:menu")]
@@ -361,7 +367,6 @@ async def get_chats_submenu_text_and_keyboard():
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
-# --- НОВОЕ: Меню администратора ---
 async def get_admin_menu_text_and_keyboard():
     text = "👑 **Панель администратора**\n\nВыберите действие:"
     keyboard = [
@@ -457,7 +462,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
 Просто пишите мне. Я помню контекст нашего разговора.
 
 🤖 **Выбор 'мозга'**
-В главном меню можно выбрать модель ИИ.
+В главном меню можно выбрать модель ИИ, включая генерацию изображений и видео.
 
 👤 **Настройка личности (`/persona`)**
 Пример: `/persona Ты — пират.`
@@ -489,6 +494,7 @@ async def model_selection_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("Gemini 2.5 Flash", callback_data='select_model:gemini-2.5-flash')],
         [InlineKeyboardButton("Gemini 1.5 Flash", callback_data='select_model:gemini-1.5-flash')],
         [InlineKeyboardButton("Nano Banana (Image)", callback_data='select_model:gemini-2.5-flash-image-preview')],
+        [InlineKeyboardButton("🎬 Veo (Video)", callback_data='select_model:veo-3.0-generate-001')],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data='menu:main')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -580,7 +586,6 @@ async def delete_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await update.message.reply_text(f"Чат `{chat_name}` удален.", parse_mode='Markdown')
 
-# --- НОВЫЕ: Функции управления пользователями ---
 @admin_only
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not redis_client:
@@ -588,11 +593,9 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Пытаемся получить ID из аргументов команды
         user_to_add_id = int(context.args[0])
         user_info_text = f"ID `{user_to_add_id}`"
     except (IndexError, ValueError):
-        # Если аргументов нет или они некорректны, проверяем, является ли сообщение ответом
         if update.message.reply_to_message:
             user_to_add = update.message.reply_to_message.from_user
             user_to_add_id = user_to_add.id
@@ -610,7 +613,6 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     redis_client.sadd(ALLOWED_USERS_REDIS_KEY, user_to_add_id)
     await update.message.reply_text(f"✅ Доступ предоставлен: {user_info_text}.", parse_mode='Markdown')
-
 
 @admin_only
 async def del_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -644,7 +646,6 @@ async def del_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     redis_client.srem(ALLOWED_USERS_REDIS_KEY, user_to_del_id)
     await update.message.reply_text(f"🗑️ Доступ отозван: {user_info_text}.", parse_mode='Markdown')
 
-
 async def list_users_logic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
     """Логика для получения списка пользователей, возвращает готовый текст."""
     if not redis_client:
@@ -663,15 +664,12 @@ async def list_users_logic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             message += f"👤 `{user_id_int}`\n"
     return message
 
-
 @admin_only
 async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /listusers."""
     response_text = await list_users_logic(update, context)
     await update.message.reply_text(response_text, parse_mode='Markdown')
 
-
-# --- ИЗМЕНЕНО: Добавлен обработчик кнопок администратора ---
 @restricted
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -752,26 +750,84 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except telegram.error.BadRequest: pass
 
 @restricted
+async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = update.message.text
+    if not prompt:
+        await update.message.reply_text("Пожалуйста, введите текстовый запрос для генерации видео.")
+        return
+
+    await update.message.reply_text(
+        f"🎬 Запрос принят: \"{prompt}\".\n\n"
+        "Начинаю генерацию видео. Это может занять несколько минут, пожалуйста, подождите..."
+    )
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=telegram.constants.ChatAction.UPLOAD_VIDEO)
+
+    temp_dir = tempfile.mkdtemp()
+    output_path = os.path.join(temp_dir, "generated_video.mp4")
+
+    try:
+        def _generate_and_poll_sync():
+            logger.info(f"Запуск синхронной задачи генерации видео с промптом: {prompt}")
+            operation = sync_genai_client.models.generate_videos(
+                model="veo-3.0-generate-001",
+                prompt=prompt,
+            )
+            
+            logger.info("Видео генерируется... Ожидание завершения операции.")
+            while not operation.done:
+                time.sleep(10)
+                operation = sync_genai_client.operations.get(operation.name)
+
+            logger.info("Генерация видео завершена. Скачивание файла...")
+            generated_video = operation.response.generated_videos[0]
+            generated_video.video.save(output_path)
+            
+            return output_path
+
+        final_video_path = await asyncio.to_thread(_generate_and_poll_sync)
+
+        logger.info(f"Отправка сгенерированного видео пользователю {update.effective_user.id}")
+        with open(final_video_path, 'rb') as video_file:
+            await update.message.reply_video(video=video_file, caption="✅ Ваше видео готово!")
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка при генерации видео: {e}")
+        await update.message.reply_text(f"😔 К сожалению, не удалось сгенерировать видео. Произошла ошибка:\n`{e}`", parse_mode='Markdown')
+    
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Временная директория {temp_dir} удалена.")
+
+@restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
     model_name = get_user_model(user_id)
     persona = get_user_persona(user_id)
+    
+    if model_name in VIDEO_GEN_MODELS:
+        await handle_video_generation(update, context)
+        return
+    
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
     try:
         model = genai.GenerativeModel(model_name, system_instruction=persona)
+        
         if model_name in IMAGE_GEN_MODELS:
             image_prompt = f"Generate a high-quality, photorealistic image of: {user_message}"
             response = await model.generate_content_async(image_prompt)
             await handle_gemini_response(update, response)
             update_history(user_id, user_message, "[Запрос на генерацию изображения]")
+        
         else:
             history = get_history(user_id)
             chat = model.start_chat(history=history)
             response_stream = await chat.send_message_async(user_message, stream=True)
             await handle_gemini_response_stream(update, response_stream, user_message)
+            
     except Exception as e:
-        logger.error(f"Ошибка при обработке текстового сообщения: {e}")
+        logger.error(f"Ошибка при обработке сообщения: {e}")
         await update.message.reply_text(f'К сожалению, произошла ошибка: {e}')
 
 @restricted
@@ -826,7 +882,6 @@ async def deep_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @restricted
 async def code_interpreter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерирует и выполняет Python код в безопасной среде Docker."""
     prompt = " ".join(context.args)
     if not prompt:
         await update.message.reply_text(
@@ -972,7 +1027,6 @@ async def test_api_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tools = [protos.Tool(google_search_retrieval={})]
         model = genai.GenerativeModel(model_name='gemini-1.5-pro', tools=tools)
         
-        # Используем не-потоковый запрос для чистоты теста
         response = await model.generate_content_async("What is the latest news about AI?")
         
         if response.text:
@@ -996,11 +1050,11 @@ async def test_api_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"`{type(e).__name__}: {e}`"
         )
 
-# --- ИЗМЕНЕНО: Добавлена инициализация пользователей и регистрация админ-команд ---
+
+# --- Точка входа ---
 def main() -> None:
     logger.info("Создание и настройка приложения...")
     
-    # --- НОВОЕ: Инициализация списка пользователей в Redis ---
     if redis_client:
         if not redis_client.exists(ALLOWED_USERS_REDIS_KEY):
             logger.info(f"Ключ '{ALLOWED_USERS_REDIS_KEY}' не найден в Redis. Инициализация из переменной окружения...")
@@ -1010,23 +1064,20 @@ def main() -> None:
             else:
                 logger.warning("Переменная окружения ALLOWED_USER_IDS пуста, в Redis не добавлено ни одного пользователя.")
         
-        # Убедимся, что администратор всегда имеет доступ
         if ADMIN_USER_ID:
             is_admin_member = redis_client.sismember(ALLOWED_USERS_REDIS_KEY, ADMIN_USER_ID)
             if not is_admin_member:
                 redis_client.sadd(ALLOWED_USERS_REDIS_KEY, ADMIN_USER_ID)
                 logger.info(f"Администратор (ID: {ADMIN_USER_ID}) добавлен в список разрешенных пользователей.")
     
-    # Увеличиваем таймауты для всех http-запросов
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     
-    # --- НОВОЕ: Админ-команды ---
+    # --- Регистрация обработчиков ---
     application.add_handler(CommandHandler("adduser", add_user_command))
     application.add_handler(CommandHandler("deluser", del_user_command))
     application.add_handler(CommandHandler("listusers", list_users_command))
 
-    # --- Пользовательские команды ---
     application.add_handler(CommandHandler(["start", "menu"], main_menu_command))
     application.add_handler(CommandHandler("clear", clear_history_command))
     application.add_handler(CommandHandler("usage", usage_command))
