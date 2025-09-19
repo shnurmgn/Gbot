@@ -2,6 +2,7 @@ import logging
 import asyncio
 import io
 import os
+import sys
 import time
 from functools import wraps
 import json
@@ -32,7 +33,6 @@ import re
 
 # --- Настройка ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-# Ключ GEMINI_API_KEY больше не является основным для аутентификации, но может быть оставлен для обратной совместимости
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') 
 ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS')
 ALLOWED_USER_IDS = [int(user_id.strip()) for user_id in ALLOWED_USER_IDS_STR.split(',')] if ALLOWED_USER_IDS_STR else []
@@ -64,7 +64,7 @@ except Exception as e:
     logging.error(f"Не удалось подключиться к Redis: {e}")
     redis_client = None
 
-# --- Настройка логирования и Gemini API (ИСПРАВЛЕНО) ---
+# --- Настройка логирования и Gemini API ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -1112,7 +1112,7 @@ if __name__ == "__main__":
     # Проверяем наличие ключевых переменных для работы
     if not all([TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS_STR, redis_client]):
         logger.error("Критическая ошибка: не заданы TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS или не удалось подключиться к Redis.")
-        return # Выходим, если базовые настройки отсутствуют
+        sys.exit(1)
 
     try:
         # Проверяем, что аутентификация Google работает
@@ -1121,11 +1121,14 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Критическая ошибка: не удалось аутентифицироваться в Google API. "
                      f"Убедитесь, что переменная GOOGLE_APPLICATION_CREDENTIALS установлена правильно. Ошибка: {e}")
-        return
+        sys.exit(1)
 
     if not SERPER_API_KEY:
         logger.warning("Ключ SERPER_API_KEY не найден, команда /search не будет работать.")
+
     if not ADMIN_USER_ID:
         logger.error("Критическая ошибка: не удалось определить ID администратора. Проверьте переменные ADMIN_USER_ID и ALLOWED_USER_IDS.")
-    else:
-        main()
+        sys.exit(1)
+    
+    # Запускаем основную функцию, если все критические проверки пройдены
+    main()
