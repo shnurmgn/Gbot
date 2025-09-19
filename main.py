@@ -14,6 +14,7 @@ from google.generativeai import protos
 
 # Библиотека для Vertex AI (видео)
 from google.cloud import aiplatform
+from google.cloud import storage
 
 from datetime import datetime
 import telegram
@@ -775,7 +776,7 @@ async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_
 
     await update.message.reply_text(
         f"🎬 Запрос принят: \"{prompt}\".\n\n"
-        "Начинаю генерацию видео через Vertex AI. Это может занять несколько минут, пожалуйста, подождите..."
+        "Отправляю задачу в Vertex AI. Генерация может занять несколько минут, пожалуйста, подождите..."
     )
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=telegram.constants.ChatAction.UPLOAD_VIDEO)
 
@@ -783,32 +784,41 @@ async def handle_video_generation(update: Update, context: ContextTypes.DEFAULT_
     output_path = os.path.join(temp_dir, "generated_video.mp4")
 
     try:
-        def _generate_sync():
-            # Это место для настоящего вызова Vertex AI SDK
-            # Точный вызов зависит от модели и версии SDK, здесь приведена заглушка
-            logger.info(f"Запуск СИНХРОННОЙ задачи генерации видео с промптом: {prompt}")
-            
-            # --- ЗАМЕНИТЕ ЭТОТ БЛОК НА РЕАЛЬНЫЙ ВЫЗОВ API ---
-            # Примерный концепт:
-            # model = aiplatform.GenerativeModel("gemini-1.5-pro-vision") # или имя Veo модели
-            # response = model.generate_content([prompt])
-            # video_uri = response.candidates[0].content.parts[0].uri
-            # # Код для скачивания видео по URI в output_path
-            
-            # Имитация долгой работы и создание фейкового файла:
-            time.sleep(15) 
-            with open(output_path, "w") as f:
-                f.write("Это фейковое видео, созданное для демонстрации.")
-            # --------------------------------------------------
+        def _generate_and_download_sync():
+            logger.info(f"Запуск реальной задачи генерации видео с промптом: {prompt}")
 
-            logger.info("Генерация видео (имитация) завершена.")
+            # 1. Инициализируем модель в Vertex AI.
+            # ПРИМЕЧАНИЕ: 'imagen-videogen-001' — это общедоступная модель. 
+            # Если у вас есть доступ к Veo, замените имя модели на то, что указано в вашей документации.
+            model = aiplatform.gapic.ModelServiceClient().get_model(name=f"projects/{GOOGLE_PROJECT_ID}/locations/{GOOGLE_LOCATION}/models/imagen-videogen-001")
+
+            # 2. Генерируем видео.
+            # Этот вызов является примерным и может потребовать адаптации под конкретную версию SDK
+            response = model.generate_content([prompt])
+            
+            # 3. Получаем URI (ссылку) на видео в Google Cloud Storage.
+            # Ответ обычно приходит в формате gs://имя-бакета/путь-к-файлу.mp4
+            gcs_uri = response.candidates[0].content.parts[0].file_data.uri
+            logger.info(f"Видео сгенерировано. URI в GCS: {gcs_uri}")
+
+            # 4. Скачиваем файл из Google Cloud Storage.
+            storage_client = storage.Client()
+            
+            bucket_name, blob_name = gcs_uri.replace("gs://", "").split("/", 1)
+            
+            bucket = storage_client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            
+            logger.info(f"Скачивание файла '{blob_name}' из бакета '{bucket_name}'...")
+            blob.download_to_filename(output_path)
+            
             return output_path
 
-        final_video_path = await asyncio.to_thread(_generate_sync)
+        final_video_path = await asyncio.to_thread(_generate_and_download_sync)
 
         logger.info(f"Отправка сгенерированного видео пользователю {update.effective_user.id}")
         with open(final_video_path, 'rb') as video_file:
-            await update.message.reply_video(video=video_file, caption="✅ Ваше видео (демо) готово!")
+            await update.message.reply_video(video=video_file, caption="✅ Ваше видео готово!")
 
     except Exception as e:
         logger.error(f"Критическая ошибка при генерации видео: {e}")
@@ -1137,7 +1147,7 @@ if __name__ == "__main__":
                      f"Убедитесь, что переменная GOOGLE_APPLICATION_CREDENTIALS установлена правильно. Ошибка: {e}")
         sys.exit(1)
 
-    if not GOOGLE_PROJECT_ID or not GOOGLE_LOCATION:
+    if not (GOOGLE_PROJECT_ID and GOOGLE_LOCATION):
         logger.warning("Переменные GOOGLE_PROJECT_ID и GOOGLE_LOCATION не заданы. Генерация видео будет недоступна.")
 
     if not SERPER_API_KEY:
