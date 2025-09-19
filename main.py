@@ -8,7 +8,6 @@ from functools import wraps
 import json
 import docx
 import google.generativeai as genai 
-from google.generativeai import client as genai_client 
 from google.generativeai import protos
 from datetime import datetime
 import telegram
@@ -72,7 +71,7 @@ logger = logging.getLogger(__name__)
 genai.configure()
 
 # Инициализируем синхронный клиент для Veo. Он также найдет креды автоматически.
-sync_genai_client = genai_client.Client()
+sync_genai_client = genai.Client()
 
 
 # --- Декораторы для проверки авторизации ---
